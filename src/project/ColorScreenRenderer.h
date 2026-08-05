@@ -5,6 +5,7 @@
 #include "../interfaces/IProjectLoader.h"
 #include "ProjectTypes.h"
 #include "../ClippedCanvas16.h"
+#include "ColorAssetLoader.h"
 
 // Color (RGB565) counterpart of MqttEPaperDisplay2's ScreenRenderer -
 // renders into a ClippedCanvas16 instead of a 1-bit ClippedCanvas1, real
@@ -15,13 +16,19 @@
 // ordering) as closely as possible - those fixes are color-depth-
 // independent, so there's no reason to rediscover them here.
 //
-// Only a subset of MqttEPaperDisplay2's object types are ported so far:
-// box, line (2-point/multi-point straight segments only - no fillet/
-// arrowhead/thick-line yet), label, MqttDataField, level-indicator.
-// MQTTIconField, icon and SoftwareButton are still TODO (need real asset/
-// BMP loading, not built yet) - tab-control/panel and MqttDataLine are
-// permanently out of scope, they aren't in the M5 Dial DDF's
-// supportedObjectTypes.
+// Every object type in the M5 Dial DDF's supportedObjectTypes is now
+// ported: box, line (2-point/multi-point straight segments only - no
+// fillet/arrowhead/thick-line yet), label, MqttDataField, level-indicator,
+// MQTTIconField, icon, SoftwareButton. icon and SoftwareButton have no
+// e-paper equivalent to port from - MqttEPaperDisplay2 never implemented
+// either (no touchscreen, and its own "icon" object type was never wired
+// up despite existing in the schema) - so their rendering (draw the
+// already-exported bitmap via ColorAssetLoader, always the "normal" state
+// for SoftwareButton until real touch tracking exists) was designed fresh
+// from the designer's own export shape (lib/project-zip.ts's
+// path/pathNormal/pathActive fields), not ported from existing firmware
+// logic. tab-control/panel and MqttDataLine are permanently out of scope,
+// they aren't in the M5 Dial DDF's supportedObjectTypes.
 class ColorScreenRenderer {
 public:
   ColorScreenRenderer(IProjectLoader& projectLoader, ClippedCanvas16* canvas);
@@ -43,6 +50,12 @@ private:
   bool renderLabel(const ScreenObject& obj);
   bool renderMQTTDataField(const ScreenObject& obj);
   bool renderLevelIndicator(const ScreenObject& obj);
+  bool renderMQTTIconField(const ScreenObject& obj);
+  bool renderIcon(const ScreenObject& obj);
+  bool renderSoftwareButton(const ScreenObject& obj);
+
+  bool evaluateCondition(float value, const String& op, float threshold) const;
+  String getIconPathForValue(const ScreenObject& obj, const String& valueStr) const;
 
   void drawTextBox(const ScreenObject& obj, const String& displayText, bool drawBorder = true);
 

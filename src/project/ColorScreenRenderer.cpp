@@ -419,12 +419,78 @@ bool ColorScreenRenderer::renderLevelIndicator(const ScreenObject& obj) {
   return true;
 }
 
+bool ColorScreenRenderer::evaluateCondition(float value, const String& op, float threshold) const {
+  if (op == ">") return value > threshold;
+  if (op == ">=") return value >= threshold;
+  if (op == "<") return value < threshold;
+  if (op == "<=") return value <= threshold;
+  // MQTTIconField's valueIconPairs use a single "=" (see the designer's
+  // mqtt-icon-field-properties.tsx) - both spellings accepted, matching
+  // MqttEPaperDisplay2's identical fix for this exact confusion.
+  if (op == "==" || op == "=") return value == threshold;
+  if (op == "!=") return value != threshold;
+  return false;
+}
+
+String ColorScreenRenderer::getIconPathForValue(const ScreenObject& obj, const String& valueStr) const {
+  float value = valueStr.toFloat();
+  for (const auto& pair : obj.properties.valueIconPairs) {
+    if (evaluateCondition(value, pair.comparisonOperator, pair.value)) {
+      return pair.path;
+    }
+  }
+  return "";
+}
+
+bool ColorScreenRenderer::renderMQTTIconField(const ScreenObject& obj) {
+  String valueStr = projectLoader_.getTopicValue(obj.properties.topic);
+  if (valueStr.isEmpty()) return false;
+
+  String iconPath = getIconPathForValue(obj, valueStr);
+  if (iconPath.isEmpty()) return false;
+
+  if (!ColorAssetLoader::drawBMPToCanvas(canvas_, iconPath, obj.x, obj.y)) {
+    // Placeholder so a missing/bad asset is visibly wrong, not invisible.
+    canvas_->fillRect(obj.x + 2, obj.y + 2, obj.width - 4, obj.height - 4, 0x0000);
+    canvas_->drawRect(obj.x, obj.y, obj.width, obj.height, 0x0000);
+  }
+  return true;
+}
+
+bool ColorScreenRenderer::renderIcon(const ScreenObject& obj) {
+  if (obj.path.isEmpty()) return false;
+  if (!ColorAssetLoader::drawBMPToCanvas(canvas_, obj.path, obj.x, obj.y)) {
+    canvas_->fillRect(obj.x + 2, obj.y + 2, obj.width - 4, obj.height - 4, 0x0000);
+    canvas_->drawRect(obj.x, obj.y, obj.width, obj.height, 0x0000);
+    return false;
+  }
+  return true;
+}
+
+// Always draws pathNormal - there's no touch tracking yet to know whether
+// this button is currently pressed (that's checkpoint 4's job). The
+// bitmap itself is already fully rendered by the designer's export
+// (drop shadow, border, label text baked in) - this only needs to decode
+// and blit it, not reconstruct any of that.
+bool ColorScreenRenderer::renderSoftwareButton(const ScreenObject& obj) {
+  if (obj.pathNormal.isEmpty()) return false;
+  if (!ColorAssetLoader::drawBMPToCanvas(canvas_, obj.pathNormal, obj.x, obj.y)) {
+    canvas_->fillRect(obj.x + 2, obj.y + 2, obj.width - 4, obj.height - 4, 0x0000);
+    canvas_->drawRect(obj.x, obj.y, obj.width, obj.height, 0x0000);
+    return false;
+  }
+  return true;
+}
+
 bool ColorScreenRenderer::renderObject(const ScreenObject& obj) {
   if (obj.type == "box") return renderBox(obj);
   if (obj.type == "line") return renderLine(obj);
   if (obj.type == "label") return renderLabel(obj);
   if (obj.type == "MqttDataField" || obj.type == "field") return renderMQTTDataField(obj);
   if (obj.type == "level-indicator") return renderLevelIndicator(obj);
+  if (obj.type == "MQTTIconField") return renderMQTTIconField(obj);
+  if (obj.type == "icon") return renderIcon(obj);
+  if (obj.type == "SoftwareButton") return renderSoftwareButton(obj);
 
   Serial.printf("[ColorScreenRenderer] Object type \"%s\" not implemented yet, skipping (id=%s)\n",
                 obj.type.c_str(), obj.id.c_str());

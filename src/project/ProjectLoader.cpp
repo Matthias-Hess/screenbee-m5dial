@@ -191,6 +191,9 @@ ScreenObject ProjectLoader::parseScreenObject(JsonObject objJson) {
   obj.width = objJson["width"] | 0;
   obj.height = objJson["height"] | 0;
   obj.zIndex = objJson["zIndex"] | 0;
+  obj.path = objJson["path"] | "";
+  obj.pathNormal = objJson["pathNormal"] | "";
+  obj.pathActive = objJson["pathActive"] | "";
 
   if (objJson["properties"].is<JsonObject>()) {
     obj.properties = parseObjectProperties(objJson["properties"]);

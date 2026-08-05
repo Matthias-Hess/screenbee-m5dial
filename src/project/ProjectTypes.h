@@ -121,6 +121,15 @@ struct ScreenObject {
   int height;
   int zIndex;
   ObjectProperties properties;
+  // Bitmap paths the designer's export flattens onto the object itself
+  // (not nested in `properties`) - see lib/project-zip.ts: an "icon"
+  // object gets `path`, a "SoftwareButton" gets `pathNormal`/`pathActive`.
+  // Not present in MqttEPaperDisplay2's ProjectTypes.h - that firmware
+  // never implemented either object type (no touchscreen, e-paper icons
+  // were never wired up either), so these are new here for M5 Dial.
+  String path;
+  String pathNormal;
+  String pathActive;
   // Only meaningful for "tab-control" (children must all be "panel") and
   // "panel" (children are arbitrary regular objects) - every other type is
   // always a leaf (empty). Child x/y are relative to this object's own
