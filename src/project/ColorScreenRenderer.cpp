@@ -77,12 +77,61 @@ int ColorScreenRenderer::getFontAscentById(const String& fontId) const {
   return 14;
 }
 
+int ColorScreenRenderer::getFontDescentById(const String& fontId) const {
+  const ProjectConfig& project = projectLoader_.getProject();
+  for (const Font& font : project.fonts) {
+    if (font.id == fontId) return font.descent;
+  }
+  return 4;
+}
+
 int ColorScreenRenderer::getFontSizeById(const String& fontId) const {
   const ProjectConfig& project = projectLoader_.getProject();
   for (const Font& font : project.fonts) {
     if (font.id == fontId) return font.size;
   }
   return 18;
+}
+
+String ColorScreenRenderer::formatNumber(const String& valueStr, int decimals, const String& thousandsSeparator) const {
+  float value = valueStr.toFloat();
+  String formatted = String(value, decimals);
+
+  if (!thousandsSeparator.isEmpty()) {
+    int decimalPos = formatted.indexOf('.');
+    if (decimalPos == -1) decimalPos = formatted.length();
+
+    int insertPos = decimalPos - 3;
+    while (insertPos > 0) {
+      if (insertPos == 1 && formatted.charAt(0) == '-') break;
+      formatted = formatted.substring(0, insertPos) + thousandsSeparator + formatted.substring(insertPos);
+      insertPos -= 3;
+      decimalPos += thousandsSeparator.length();
+    }
+  }
+  return formatted;
+}
+
+float ColorScreenRenderer::interpolateCalibration(float value, const std::vector<CalibrationPoint>& points) const {
+  if (points.empty()) return value;
+  if (points.size() == 1) return points[0].barSizePercent;
+
+  std::vector<CalibrationPoint> sortedPoints = points;
+  std::sort(sortedPoints.begin(), sortedPoints.end(),
+            [](const CalibrationPoint& a, const CalibrationPoint& b) { return a.value < b.value; });
+
+  if (value <= sortedPoints[0].value) return sortedPoints[0].barSizePercent;
+  if (value >= sortedPoints[sortedPoints.size() - 1].value) return sortedPoints[sortedPoints.size() - 1].barSizePercent;
+
+  for (size_t i = 0; i + 1 < sortedPoints.size(); i++) {
+    if (value >= sortedPoints[i].value && value <= sortedPoints[i + 1].value) {
+      float x1 = sortedPoints[i].value, y1 = sortedPoints[i].barSizePercent;
+      float x2 = sortedPoints[i + 1].value, y2 = sortedPoints[i + 1].barSizePercent;
+      float percent = (value - x1) / (x2 - x1);
+      return y1 + percent * (y2 - y1);
+    }
+  }
+  return 0;
 }
 
 // See MqttEPaperDisplay2's ScreenRenderer::measureTrueTextWidth() for why
@@ -248,10 +297,134 @@ bool ColorScreenRenderer::renderLine(const ScreenObject& obj) {
   return true;
 }
 
+bool ColorScreenRenderer::renderMQTTDataField(const ScreenObject& obj) {
+  String valueStr = projectLoader_.getTopicValue(obj.properties.topic);
+
+  String trimmedCheck = valueStr;
+  trimmedCheck.trim();
+  bool isBlank = trimmedCheck.isEmpty();
+  if (isBlank) valueStr = "";
+
+  String formattedValue = valueStr;
+  if (!isBlank && obj.properties.displayAs == "Formatted Number") {
+    formattedValue = formatNumber(valueStr, obj.properties.numberOfDecimals, obj.properties.thousandsSeparator);
+  }
+
+  String displayText = obj.properties.prefix + formattedValue + obj.properties.postfix;
+  drawTextBox(obj, displayText, true);
+  return true;
+}
+
+// Same bar/text layout math as MqttEPaperDisplay2's renderLevelIndicator()
+// (padding=4, direction handling, center-align via a single combined
+// jsRound division, ascent+descent-based vertical centering) - all of
+// that is color-depth-independent. What differs: that firmware's
+// "text visible against both the bar and its background" effect is a
+// 1-bit pixel-invert trick (draw a tiny GFXcanvas1, then swap every 0<->1
+// while blitting) - there's no equivalent "invert" for arbitrary RGB565
+// colors. The color equivalent here draws the text twice instead: once
+// across the whole object in fillColor, then the bar rect painted solid
+// over it (erasing that portion), then the SAME text redrawn a second
+// time but clipped to just the bar rect, in bgColor - same visual result
+// (fillColor text outside the bar, bgColor text inside it), no invert
+// needed.
+bool ColorScreenRenderer::renderLevelIndicator(const ScreenObject& obj) {
+  String valueStr = projectLoader_.getTopicValue(obj.properties.topic);
+  float value = valueStr.isEmpty() ? 0.0f : valueStr.toFloat();
+
+  float fillPercent = interpolateCalibration(value, obj.properties.calibrationPoints);
+  if (fillPercent < 0) fillPercent = 0;
+  if (fillPercent > 100) fillPercent = 100;
+
+  bool bgTransparent = false;
+  uint16_t bgColor = parseHexColor(obj.properties.backgroundColor, &bgTransparent);
+  uint16_t fillColor = parseHexColor(obj.properties.fillColor);
+  bool borderTransparent = false;
+  uint16_t borderColor = parseHexColor(obj.properties.borderColor, &borderTransparent);
+
+  if (!bgTransparent) {
+    canvas_->fillRect(obj.x, obj.y, obj.width, obj.height, bgColor);
+  }
+  if (!borderTransparent) {
+    canvas_->drawRect(obj.x, obj.y, obj.width, obj.height, borderColor);
+  }
+
+  const int padding = 4;
+  int innerX = obj.x + padding;
+  int innerY = obj.y + padding;
+  int innerWidth = obj.width - padding * 2;
+  int innerHeight = obj.height - padding * 2;
+
+  int fillWidth = innerWidth, fillHeight = innerHeight, fillX = innerX, fillY = innerY;
+  if (obj.properties.barDirection == "left-to-right") {
+    fillWidth = (innerWidth * fillPercent) / 100;
+  } else if (obj.properties.barDirection == "right-to-left") {
+    fillWidth = (innerWidth * fillPercent) / 100;
+    fillX = innerX + innerWidth - fillWidth;
+  } else if (obj.properties.barDirection == "bottom-to-top") {
+    fillHeight = (innerHeight * fillPercent) / 100;
+    fillY = innerY + innerHeight - fillHeight;
+  } else if (obj.properties.barDirection == "top-to-bottom") {
+    fillHeight = (innerHeight * fillPercent) / 100;
+  }
+  int barX = fillX, barY = fillY, barWidth = fillWidth, barHeight = fillHeight;
+
+  if (obj.properties.displayValue == "none") return true;
+
+  String displayText;
+  if (obj.properties.displayValue == "percentage") {
+    displayText = String((int)(fillPercent + 0.5f)) + "%";
+  } else if (obj.properties.displayValue == "value") {
+    displayText = valueStr;
+  }
+  if (displayText.isEmpty()) return true;
+
+  const uint8_t* u8font = getU8g2FontById(obj.properties.fontId);
+  u8g2_.setFont(u8font);
+  u8g2_.setFontMode(1);
+
+  int16_t textWidth = measureTrueTextWidth(displayText, u8font);
+  int16_t fontAscent = getFontAscentById(obj.properties.fontId);
+  int16_t fontDescent = getFontDescentById(obj.properties.fontId);
+
+  int16_t textX = obj.x + 1 + jsRound((obj.width - textWidth) / 2.0f);
+  int16_t fontHeight = fontAscent + fontDescent;
+  int16_t verticalCenterOffset = jsRound((obj.height - fontHeight) / 2.0f);
+  int16_t textY = obj.y + verticalCenterOffset + fontAscent;
+
+  u8g2_.setFontDirection(0);
+
+  // Pass 1: text in fillColor across the whole object.
+  u8g2_.setForegroundColor(fillColor);
+  canvas_->setClip(obj.x, obj.y, obj.width, obj.height);
+  u8g2_.setCursor(textX, textY);
+  u8g2_.print(displayText);
+  canvas_->clearClip();
+
+  // Bar, painted solid over whatever text pass 1 drew there.
+  if (barWidth > 0 && barHeight > 0) {
+    canvas_->fillRect(barX, barY, barWidth, barHeight, fillColor);
+
+    // Pass 2: same text again, clipped to just the bar, in bgColor - font
+    // is unchanged since pass 1 (same pointer), so no setFont() call here
+    // (that would silently reset transparency - see this class's other
+    // setFont-before-setFontMode comments for why).
+    u8g2_.setForegroundColor(bgColor);
+    canvas_->setClip(barX, barY, barWidth, barHeight);
+    u8g2_.setCursor(textX, textY);
+    u8g2_.print(displayText);
+    canvas_->clearClip();
+  }
+
+  return true;
+}
+
 bool ColorScreenRenderer::renderObject(const ScreenObject& obj) {
   if (obj.type == "box") return renderBox(obj);
   if (obj.type == "line") return renderLine(obj);
   if (obj.type == "label") return renderLabel(obj);
+  if (obj.type == "MqttDataField" || obj.type == "field") return renderMQTTDataField(obj);
+  if (obj.type == "level-indicator") return renderLevelIndicator(obj);
 
   Serial.printf("[ColorScreenRenderer] Object type \"%s\" not implemented yet, skipping (id=%s)\n",
                 obj.type.c_str(), obj.id.c_str());

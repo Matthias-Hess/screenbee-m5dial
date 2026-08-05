@@ -17,11 +17,11 @@
 //
 // Only a subset of MqttEPaperDisplay2's object types are ported so far:
 // box, line (2-point/multi-point straight segments only - no fillet/
-// arrowhead/thick-line yet), label. MQTTIconField, MqttDataField,
-// level-indicator, icon and SoftwareButton are still TODO (tracked as the
-// next slice of Checkpoint 2, not silently dropped) - tab-control/panel
-// and MqttDataLine are permanently out of scope, they aren't in the M5
-// Dial DDF's supportedObjectTypes.
+// arrowhead/thick-line yet), label, MqttDataField, level-indicator.
+// MQTTIconField, icon and SoftwareButton are still TODO (need real asset/
+// BMP loading, not built yet) - tab-control/panel and MqttDataLine are
+// permanently out of scope, they aren't in the M5 Dial DDF's
+// supportedObjectTypes.
 class ColorScreenRenderer {
 public:
   ColorScreenRenderer(IProjectLoader& projectLoader, ClippedCanvas16* canvas);
@@ -41,13 +41,18 @@ private:
   bool renderBox(const ScreenObject& obj);
   bool renderLine(const ScreenObject& obj);
   bool renderLabel(const ScreenObject& obj);
+  bool renderMQTTDataField(const ScreenObject& obj);
+  bool renderLevelIndicator(const ScreenObject& obj);
 
   void drawTextBox(const ScreenObject& obj, const String& displayText, bool drawBorder = true);
 
   const uint8_t* getU8g2FontById(const String& fontId) const;
   int getFontAscentById(const String& fontId) const;
+  int getFontDescentById(const String& fontId) const;
   int getFontSizeById(const String& fontId) const;
   int16_t measureTrueTextWidth(const String& text, const uint8_t* u8font);
+  String formatNumber(const String& valueStr, int decimals, const String& thousandsSeparator) const;
+  float interpolateCalibration(float value, const std::vector<CalibrationPoint>& points) const;
 
   // Parses "#rrggbb" (or "#rrggbbaa", alpha ignored except to detect
   // full transparency) into a real RGB565 value - unlike the e-paper
