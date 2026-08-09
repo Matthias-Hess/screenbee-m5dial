@@ -4,6 +4,9 @@
 #include <ArduinoJson.h>
 #include "DeviceInfo.h"
 #include "project/ProjectInstaller.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
 TestInterfaceServer::TestInterfaceServer(ClippedCanvas16* canvas, uint16_t port)
   : canvas_(canvas), port_(port), serverRunning_(false) {
@@ -86,7 +89,7 @@ void TestInterfaceServer::handleProjectUploadChunk() {
     }
 
     Serial.println("[TestInterface] Validating + extracting zip...");
-    bool ok = validateAndExtractZip();
+    bool ok = runValidateAndExtractOnDedicatedTask();
     Serial.printf("[TestInterface] validateAndExtractZip() -> %s\n", ok ? "true" : "false");
 
     if (ok) {
@@ -109,6 +112,53 @@ void TestInterfaceServer::handleProjectUploadChunk() {
 
 void TestInterfaceServer::handleProjectUploadComplete() {
   sendJSONResponse(true, "Processing upload...");
+}
+
+namespace {
+struct ExtractTaskContext {
+  TestInterfaceServer* self;
+  bool result;
+  SemaphoreHandle_t done;
+};
+
+void extractTaskEntry(void* param) {
+  ExtractTaskContext* ctx = (ExtractTaskContext*)param;
+  ctx->result = ctx->self->validateAndExtractZip();
+  xSemaphoreGive(ctx->done);
+  vTaskDelete(nullptr);
+}
+} // namespace
+
+bool TestInterfaceServer::runValidateAndExtractOnDedicatedTask() {
+  ExtractTaskContext ctx;
+  ctx.self = this;
+  ctx.result = false;
+  ctx.done = xSemaphoreCreateBinary();
+  if (!ctx.done) {
+    Serial.println("[TestInterface] Failed to create extraction semaphore, falling back to inline call");
+    return validateAndExtractZip();
+  }
+
+  // 40KB - generous headroom over the ~8KB tinfl_decompressor plus
+  // whatever else the zip-parsing/JSON-parsing call chain needs, without
+  // touching the loop task's own (deliberately modest, 32KB) stack that
+  // normal project loading depends on. See the header comment on this
+  // method's declaration for the diagnostic history behind this.
+  const uint32_t kStackWords = 40960 / sizeof(StackType_t);
+  TaskHandle_t taskHandle = nullptr;
+  BaseType_t created = xTaskCreate(extractTaskEntry, "zipExtract", kStackWords, &ctx, 1, &taskHandle);
+  if (created != pdPASS) {
+    Serial.println("[TestInterface] Failed to create extraction task, falling back to inline call");
+    vSemaphoreDelete(ctx.done);
+    return validateAndExtractZip();
+  }
+
+  // No sensible timeout shorter than "wait for it" here - a stuck
+  // extraction would need investigating on its own merits, not silently
+  // giving up and leaving the temp zip/task in an undefined state.
+  xSemaphoreTake(ctx.done, portMAX_DELAY);
+  vSemaphoreDelete(ctx.done);
+  return ctx.result;
 }
 
 bool TestInterfaceServer::validateAndExtractZip() {

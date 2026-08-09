@@ -104,14 +104,72 @@ String peekProjectDeviceId(const String& zipPath) {
     return "";
   }
 
-  size_t jsonSize = 0;
-  Serial.println("[ProjectInstaller] calling mz_zip_reader_extract_file_to_heap...");
-  void* jsonData = mz_zip_reader_extract_file_to_heap(&zip, "project.json", &jsonSize, 0);
-  Serial.printf("[ProjectInstaller] extract -> %p, jsonSize=%u\n", jsonData, (unsigned)jsonSize);
+  mz_uint32 fileIndex = 0;
+  Serial.println("[ProjectInstaller] locating project.json...");
+  bool located = mz_zip_reader_locate_file_v2(&zip, "project.json", nullptr, 0, &fileIndex);
+  Serial.printf("[ProjectInstaller] locate -> %d, fileIndex=%u\n", (int)located, (unsigned)fileIndex);
+  if (!located) {
+    mz_zip_reader_end(&zip);
+    free(zipData);
+    return "";
+  }
+
+  mz_zip_archive_file_stat fileStat;
+  memset(&fileStat, 0, sizeof(fileStat));
+  bool statOk = mz_zip_reader_file_stat(&zip, fileIndex, &fileStat);
+  Serial.printf("[ProjectInstaller] file_stat -> %d, comp_size=%u, uncomp_size=%u, method=%u\n",
+                (int)statOk, (unsigned)fileStat.m_comp_size, (unsigned)fileStat.m_uncomp_size, (unsigned)fileStat.m_method);
+  if (!statOk) {
+    mz_zip_reader_end(&zip);
+    free(zipData);
+    return "";
+  }
+
+  // Deliberately over-allocate past what m_uncomp_size claims is needed,
+  // with a canary region after it - diagnostic experiment (2026-08-09) for
+  // the DEFLATE-entry crash inside mz_zip_reader_extract_file_to_heap():
+  // that call sizes its destination buffer to *exactly* m_uncomp_size, so
+  // if tinfl_decompress ever writes even slightly past the bound it's
+  // told, it corrupts whatever heap allocation happens to sit right after
+  // it - consistent with the varying-by-input-size crash signatures seen
+  // (a heap-corruption fingerprint, not one fixed logic error). Calling
+  // the lower-level mz_zip_reader_extract_to_mem_no_alloc() instead, into
+  // a buffer padded well past m_uncomp_size, tells us two things at once:
+  // whether extraction survives at all with headroom (works around the
+  // bug if so), and by checking the canary bytes afterward, whether an
+  // overrun actually happened even when it doesn't crash outright.
+  const size_t kCanarySize = 256;
+  size_t jsonSize = fileStat.m_uncomp_size;
+  size_t paddedSize = jsonSize + kCanarySize;
+  uint8_t* jsonData = (uint8_t*)malloc(paddedSize);
+  Serial.printf("[ProjectInstaller] padded malloc(%u) -> %p\n", (unsigned)paddedSize, (void*)jsonData);
+  if (!jsonData) {
+    mz_zip_reader_end(&zip);
+    free(zipData);
+    return "";
+  }
+  memset(jsonData + jsonSize, 0xAA, kCanarySize);
+
+  Serial.println("[ProjectInstaller] calling mz_zip_reader_extract_to_mem_no_alloc (padded buffer)...");
+  bool extractOk = mz_zip_reader_extract_to_mem_no_alloc(&zip, fileIndex, jsonData, paddedSize, 0, nullptr, 0);
+  Serial.printf("[ProjectInstaller] extract -> %d\n", (int)extractOk);
+
+  bool canaryIntact = true;
+  for (size_t i = 0; i < kCanarySize; i++) {
+    if (jsonData[jsonSize + i] != 0xAA) {
+      canaryIntact = false;
+      break;
+    }
+  }
+  Serial.printf("[ProjectInstaller] canary intact -> %d\n", (int)canaryIntact);
+
   mz_zip_reader_end(&zip);
   free(zipData);
 
-  if (!jsonData) return "";
+  if (!extractOk) {
+    free(jsonData);
+    return "";
+  }
 
   // Matches ProjectLoader.cpp's own NestingLimit(30) exactly - see the
   // e-paper ProjectInstaller's identical comment for why the default (10)
@@ -119,7 +177,7 @@ String peekProjectDeviceId(const String& zipPath) {
   // icon-pair arrays etc. are involved.
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, (const char*)jsonData, jsonSize, DeserializationOption::NestingLimit(30));
-  mz_free(jsonData);
+  free(jsonData);
   if (err) return "";
 
   const char* deviceId = doc["deviceId"] | "";
