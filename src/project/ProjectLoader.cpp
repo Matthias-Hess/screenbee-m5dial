@@ -32,6 +32,8 @@ bool ProjectLoader::parseJSONFromFile(File& file) {
   
   // Check if we have enough memory
   if (ESP.getMaxAllocHeap() < bufferSize) {
+    Serial.printf("[ProjectLoader] Not enough contiguous heap to load %s (need %u, have %u)\n",
+                  file.name(), (unsigned)bufferSize, (unsigned)ESP.getMaxAllocHeap());
     return false;
   }
   

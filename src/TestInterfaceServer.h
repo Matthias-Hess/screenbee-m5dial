@@ -77,25 +77,6 @@ private:
   void handleProjectUploadChunk();
   void handleProjectUploadComplete();
 
-  // Runs validateAndExtractZip() on a dedicated FreeRTOS task with a large
-  // stack, instead of directly on whatever task calls handleProjectUploadChunk
-  // (the Arduino loop task, already carrying WebServer's own multipart-
-  // parsing stack frames by this point). Diagnostic finding (2026-08-09):
-  // zip extraction crashes specifically on DEFLATE-compressed entries -
-  // padding the destination *heap* buffer well past the expected size did
-  // NOT prevent the crash, which rules out a simple output-buffer overrun
-  // and points at miniz's own tinfl_decompressor (~8KB, stack-local inside
-  // the extraction call) overflowing *its* stack frame instead - a frame
-  // that, on the upload path specifically, sits far deeper in the call
-  // chain (loop -> WebServer::handleClient -> multipart parsing -> this
-  // handler -> ProjectInstaller -> miniz) than on the normal boot-time
-  // project-load path (which stayed fine even when the *global* loop-task
-  // stack was raised only to 32KB). Isolating just this call onto its own
-  // task with generous headroom avoids re-litigating that same global
-  // stack-size/heap-starvation tradeoff for the one path that actually
-  // needs it.
-  bool runValidateAndExtractOnDedicatedTask();
-
   // POST /api/screen - form-urlencoded "index=N" (screenSwitchBody in the
   // DDF's testInterface, matching every other control endpoint in this
   // codebase's convention - not a JSON body).

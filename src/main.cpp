@@ -27,6 +27,10 @@
 #include "WiFiSetupServer.h"
 #include "MqttClient.h"
 #include "TestInterfaceServer.h"
+#ifdef JTAG_DEBUG_TEST
+#include "project/ProjectInstaller.h"
+#include "test_deflate_zip.h"
+#endif
 
 ClippedCanvas16 canvas(240, 240);
 ProjectLoader projectLoader;
@@ -295,6 +299,30 @@ void setupWiFi() {
   Serial.println("[M5Dial] wifiSetupServer.start() returned");
 }
 
+#ifdef JTAG_DEBUG_TEST
+// JTAG-only (env:m5dial_debug + -DJTAG_DEBUG_TEST): reproduces the
+// DEFLATE-extraction crash without WiFi/HTTP in the loop at all, so a
+// live JTAG session only has to stay stable through boot + this one call,
+// not through an active WiFi radio too (which proved USB-flaky under
+// combined load in an earlier debugging session - see platformio.ini's
+// env:m5dial_debug comment). Runs before setupWiFi() specifically so
+// there's no radio activity yet when the crash happens.
+void runJtagDebugTest() {
+  File f = LittleFS.open("/jtag_test.zip", "w");
+  if (!f) {
+    Serial.println("[JtagDebugTest] Failed to open /jtag_test.zip for writing");
+    return;
+  }
+  f.write(TEST_DEFLATE_ZIP, sizeof(TEST_DEFLATE_ZIP));
+  f.close();
+  Serial.printf("[JtagDebugTest] Wrote /jtag_test.zip (%d bytes)\n", (int)sizeof(TEST_DEFLATE_ZIP));
+
+  Serial.println("[JtagDebugTest] Calling peekProjectDeviceId - set breakpoints/watchpoints now");
+  String deviceId = ProjectInstaller::peekProjectDeviceId("/jtag_test.zip");
+  Serial.printf("[JtagDebugTest] peekProjectDeviceId() -> \"%s\"\n", deviceId.c_str());
+}
+#endif
+
 void setup() {
   auto cfg = M5.config();
   M5Dial.begin(cfg, /*enableEncoder=*/true, /*enableRFID=*/false);
@@ -309,6 +337,10 @@ void setup() {
   }
   writeTestProject();
   writeTestAssets();
+
+#ifdef JTAG_DEBUG_TEST
+  runJtagDebugTest();
+#endif
 
   Serial.println("[M5Dial] Calling configManager.begin()");
   configManager.begin();

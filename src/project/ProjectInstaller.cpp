@@ -76,6 +76,109 @@ void createDirectoriesForPath(const String& path) {
 
 } // namespace
 
+// Custom allocator wired into every mz_zip_archive used for DEFLATE
+// extraction. Two separate bugs had to be found and fixed here (2026-08-09,
+// full history in docs/device-contract.md (designer repo) §8):
+//
+// 1. A genuine upstream miniz bug: mz_zip_reader_extract_iter_new()'s OOM
+//    cleanup path frees a non-heap pointer for in-memory archives - see
+//    lib/miniz/miniz_zip.c's patch comment. That was the actual cause of
+//    every DEFLATE-extraction crash chased earlier in this investigation
+//    (a stack-based tinfl_decompressor overflow was suspected first and
+//    "fixed" by switching APIs and adding safety padding - neither was
+//    the real bug, though the API switch to the iterator-based extraction
+//    functions is still worth keeping).
+//
+// 2. Once (1) stopped the crash, extraction still failed cleanly with
+//    MZ_ZIP_ALLOC_FAILED: the OOM path was still being *hit*, just no
+//    longer corrupting memory when it was. mz_zip_reader_extract_iter_new()
+//    needs one 32KB *contiguous* block (TINFL_LZ_DICT_SIZE, the DEFLATE
+//    dictionary window) - by the time a project upload reaches this code,
+//    WiFi/WebServer/LittleFS have fragmented the heap enough that no single
+//    32KB block survives even with 100KB+ total free (confirmed via
+//    heap_caps_get_largest_free_block()). A dedicated FreeRTOS task with
+//    its own large stack was tried as a fix and made this *worse* (the
+//    task's own stack is itself a large contiguous allocation, competing
+//    for the same scarce blocks) before being removed entirely - see git
+//    history on TestInterfaceServer::runValidateAndExtractOnDedicatedTask().
+//
+// The fix: reserve both fixed-size buffers miniz needs for DEFLATE
+// extraction as *padded static* buffers (BSS, not heap - allocated once at
+// link time, never competes with runtime fragmentation, and immune to the
+// tinfl_decompress overrun found below since there's guard space on both
+// sides): the ~9.5KB iterator state struct (mz_zip_reader_extract_iter_state
+// is a fixed compile-time size, always the same for every call) and the
+// 32KB DEFLATE dictionary window (TINFL_LZ_DICT_SIZE). Every other
+// allocation miniz makes here (central directory bookkeeping - small,
+// varies with entry count) goes through plain malloc()/free()/realloc(),
+// unaffected by any of this.
+//
+// Why padding is needed at all: the original DEFLATE-extraction
+// investigation (before the two miniz bugs above were isolated) measured
+// tinfl_decompress writing 100-270 bytes past the end of the dictionary
+// window via a padded-canary probe. That overrun is real, independent of
+// the two bugs above, and - per the 2026-08-09 A/B test that removed
+// padding entirely to isolate bug (1) - lands on *whichever* of these two
+// buffers' true end happens to be reachable, corrupting the heap block
+// that follows it (first observed as pWrite_buf's neighbor, later as
+// pState's neighbor once pWrite_buf became a guarded static buffer and
+// pState was still plain malloc()). Both need guarding, not just one.
+// Kept generous since it's pure BSS, not heap - no fragmentation cost
+// either way, unlike heap-based padding (tried first, see git history:
+// scaled from 1KB up to 40KB and was *still* sometimes insufficient,
+// because a heap-based pad competes with the same fragmentation this
+// buffer exists to avoid in the first place).
+const size_t kGuardPad = 4096;
+
+uint8_t g_dictWindowRegion[TINFL_LZ_DICT_SIZE + kGuardPad * 2];
+uint8_t* const g_dictWindowBuffer = g_dictWindowRegion + kGuardPad;
+bool g_dictWindowInUse = false;
+
+const size_t kIterStateSize = sizeof(mz_zip_reader_extract_iter_state);
+uint8_t g_iterStateRegion[kIterStateSize + kGuardPad * 2];
+uint8_t* const g_iterStateBuffer = g_iterStateRegion + kGuardPad;
+bool g_iterStateInUse = false;
+
+void* dictReservingAlloc(void* opaque, size_t items, size_t size) {
+  (void)opaque;
+  size_t realSize = items * size;
+  if (realSize == TINFL_LZ_DICT_SIZE && !g_dictWindowInUse) {
+    g_dictWindowInUse = true;
+    return g_dictWindowBuffer;
+  }
+  if (realSize == kIterStateSize && !g_iterStateInUse) {
+    g_iterStateInUse = true;
+    return g_iterStateBuffer;
+  }
+  return malloc(realSize);
+}
+void dictReservingFree(void* opaque, void* address) {
+  (void)opaque;
+  if (!address) return;
+  if (address == g_dictWindowBuffer) {
+    g_dictWindowInUse = false;
+    return;
+  }
+  if (address == g_iterStateBuffer) {
+    g_iterStateInUse = false;
+    return;
+  }
+  free(address);
+}
+void* dictReservingRealloc(void* opaque, void* address, size_t items, size_t size) {
+  // miniz never reallocs either of the two buffers above (both allocated
+  // once at their final size), only the smaller central-directory
+  // bookkeeping arrays - plain realloc is always correct for those, since
+  // they never pass through either static buffer.
+  (void)opaque;
+  return realloc(address, items * size);
+}
+void useDictReservingAllocator(mz_zip_archive& zip) {
+  zip.m_pAlloc = dictReservingAlloc;
+  zip.m_pFree = dictReservingFree;
+  zip.m_pRealloc = dictReservingRealloc;
+}
+
 namespace ProjectInstaller {
 
 String peekProjectDeviceId(const String& zipPath) {
@@ -83,32 +186,24 @@ String peekProjectDeviceId(const String& zipPath) {
   if (!zipFile) return "";
 
   size_t zipSize = zipFile.size();
-  Serial.printf("[ProjectInstaller] zipSize=%u\n", (unsigned)zipSize);
   uint8_t* zipData = (uint8_t*)malloc(zipSize);
-  Serial.printf("[ProjectInstaller] malloc -> %p\n", (void*)zipData);
   if (!zipData) {
     zipFile.close();
     return "";
   }
   zipFile.readBytes((char*)zipData, zipSize);
   zipFile.close();
-  Serial.println("[ProjectInstaller] readBytes done");
 
   mz_zip_archive zip;
   memset(&zip, 0, sizeof(zip));
-  Serial.println("[ProjectInstaller] calling mz_zip_reader_init_mem...");
-  bool initOk = mz_zip_reader_init_mem(&zip, zipData, zipSize, 0);
-  Serial.printf("[ProjectInstaller] mz_zip_reader_init_mem -> %d\n", (int)initOk);
-  if (!initOk) {
+  useDictReservingAllocator(zip);
+  if (!mz_zip_reader_init_mem(&zip, zipData, zipSize, 0)) {
     free(zipData);
     return "";
   }
 
   mz_uint32 fileIndex = 0;
-  Serial.println("[ProjectInstaller] locating project.json...");
-  bool located = mz_zip_reader_locate_file_v2(&zip, "project.json", nullptr, 0, &fileIndex);
-  Serial.printf("[ProjectInstaller] locate -> %d, fileIndex=%u\n", (int)located, (unsigned)fileIndex);
-  if (!located) {
+  if (!mz_zip_reader_locate_file_v2(&zip, "project.json", nullptr, 0, &fileIndex)) {
     mz_zip_reader_end(&zip);
     free(zipData);
     return "";
@@ -116,52 +211,38 @@ String peekProjectDeviceId(const String& zipPath) {
 
   mz_zip_archive_file_stat fileStat;
   memset(&fileStat, 0, sizeof(fileStat));
-  bool statOk = mz_zip_reader_file_stat(&zip, fileIndex, &fileStat);
-  Serial.printf("[ProjectInstaller] file_stat -> %d, comp_size=%u, uncomp_size=%u, method=%u\n",
-                (int)statOk, (unsigned)fileStat.m_comp_size, (unsigned)fileStat.m_uncomp_size, (unsigned)fileStat.m_method);
-  if (!statOk) {
+  if (!mz_zip_reader_file_stat(&zip, fileIndex, &fileStat)) {
     mz_zip_reader_end(&zip);
     free(zipData);
     return "";
   }
 
-  // Deliberately over-allocate past what m_uncomp_size claims is needed,
-  // with a canary region after it - diagnostic experiment (2026-08-09) for
-  // the DEFLATE-entry crash inside mz_zip_reader_extract_file_to_heap():
-  // that call sizes its destination buffer to *exactly* m_uncomp_size, so
-  // if tinfl_decompress ever writes even slightly past the bound it's
-  // told, it corrupts whatever heap allocation happens to sit right after
-  // it - consistent with the varying-by-input-size crash signatures seen
-  // (a heap-corruption fingerprint, not one fixed logic error). Calling
-  // the lower-level mz_zip_reader_extract_to_mem_no_alloc() instead, into
-  // a buffer padded well past m_uncomp_size, tells us two things at once:
-  // whether extraction survives at all with headroom (works around the
-  // bug if so), and by checking the canary bytes afterward, whether an
-  // overrun actually happened even when it doesn't crash outright.
-  const size_t kCanarySize = 256;
+  // See useDictReservingAllocator() above for why the zip's allocator is
+  // overridden. Separately, don't trust mz_zip_reader_extract_iter_free()'s
+  // own return value for success/failure here - verify against
+  // fileStat.m_crc32 ourselves instead, over jsonData (a plain, unrelated
+  // allocation unaffected by anything miniz's internal bookkeeping gets
+  // wrong).
   size_t jsonSize = fileStat.m_uncomp_size;
-  size_t paddedSize = jsonSize + kCanarySize;
-  uint8_t* jsonData = (uint8_t*)malloc(paddedSize);
-  Serial.printf("[ProjectInstaller] padded malloc(%u) -> %p\n", (unsigned)paddedSize, (void*)jsonData);
+  uint8_t* jsonData = (uint8_t*)malloc(jsonSize);
   if (!jsonData) {
     mz_zip_reader_end(&zip);
     free(zipData);
     return "";
   }
-  memset(jsonData + jsonSize, 0xAA, kCanarySize);
 
-  Serial.println("[ProjectInstaller] calling mz_zip_reader_extract_to_mem_no_alloc (padded buffer)...");
-  bool extractOk = mz_zip_reader_extract_to_mem_no_alloc(&zip, fileIndex, jsonData, paddedSize, 0, nullptr, 0);
-  Serial.printf("[ProjectInstaller] extract -> %d\n", (int)extractOk);
-
-  bool canaryIntact = true;
-  for (size_t i = 0; i < kCanarySize; i++) {
-    if (jsonData[jsonSize + i] != 0xAA) {
-      canaryIntact = false;
-      break;
+  bool extractOk = false;
+  mz_zip_reader_extract_iter_state* pState = mz_zip_reader_extract_iter_new(&zip, fileIndex, 0);
+  if (pState) {
+    size_t totalRead = 0;
+    while (totalRead < jsonSize) {
+      size_t bytesRead = mz_zip_reader_extract_iter_read(pState, jsonData + totalRead, jsonSize - totalRead);
+      if (bytesRead == 0) break;
+      totalRead += bytesRead;
     }
+    mz_zip_reader_extract_iter_free(pState);
+    extractOk = (totalRead == jsonSize) && (mz_crc32(MZ_CRC32_INIT, jsonData, jsonSize) == fileStat.m_crc32);
   }
-  Serial.printf("[ProjectInstaller] canary intact -> %d\n", (int)canaryIntact);
 
   mz_zip_reader_end(&zip);
   free(zipData);
@@ -211,6 +292,7 @@ bool installProjectZipFromFile(const String& zipPath, String& errorOut) {
 
   mz_zip_archive zip;
   memset(&zip, 0, sizeof(zip));
+  useDictReservingAllocator(zip);
   if (!mz_zip_reader_init_mem(&zip, zipData, zipSize, 0)) {
     free(zipData);
     errorOut = "Invalid zip archive";
@@ -246,19 +328,31 @@ bool installProjectZipFromFile(const String& zipPath, String& errorOut) {
 
     mz_zip_reader_extract_iter_state* pState = mz_zip_reader_extract_iter_new(&zip, i, 0);
     if (!pState) {
+      Serial.printf("[ProjectInstaller] extract_iter_new failed for %s (err=%d)\n", file_stat.m_filename, (int)mz_zip_get_last_error(&zip));
       free(buffer);
       outFile.close();
       success = false;
       break;
     }
 
+    // Don't trust mz_zip_reader_extract_iter_free()'s own return value for
+    // DEFLATE entries - see the matching comment in peekProjectDeviceId()
+    // above for why. Verify against file_stat.m_crc32 ourselves instead.
+    mz_uint32 crc = MZ_CRC32_INIT;
+    mz_uint64 totalWritten = 0;
     while (true) {
       size_t bytesRead = mz_zip_reader_extract_iter_read(pState, buffer, BUFFER_SIZE);
       if (bytesRead == 0) {
-        if (mz_zip_reader_extract_iter_free(pState) != MZ_TRUE) success = false;
+        mz_zip_reader_extract_iter_free(pState);
         break;
       }
+      crc = mz_crc32(crc, buffer, bytesRead);
+      totalWritten += bytesRead;
       outFile.write(buffer, bytesRead);
+    }
+    if (totalWritten != file_stat.m_uncomp_size || crc != file_stat.m_crc32) {
+      Serial.printf("[ProjectInstaller] extract verification failed for %s\n", file_stat.m_filename);
+      success = false;
     }
 
     free(buffer);

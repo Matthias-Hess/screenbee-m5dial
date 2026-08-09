@@ -4,9 +4,6 @@
 #include <ArduinoJson.h>
 #include "DeviceInfo.h"
 #include "project/ProjectInstaller.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/semphr.h"
 
 TestInterfaceServer::TestInterfaceServer(ClippedCanvas16* canvas, uint16_t port)
   : canvas_(canvas), port_(port), serverRunning_(false) {
@@ -51,7 +48,6 @@ void TestInterfaceServer::handleProjectUploadChunk() {
   HTTPUpload& upload = webServer_->upload();
 
   if (upload.status == UPLOAD_FILE_START) {
-    Serial.println("[TestInterface] Upload START");
     // A previous interrupted attempt may have left this open - see
     // UnifiedConfigurator::handleProjectUploadFile()'s identical comment on
     // the e-paper side for why this close-first matters (LittleFS refuses
@@ -64,15 +60,13 @@ void TestInterfaceServer::handleProjectUploadChunk() {
     }
     uploadFile_ = LittleFS.open("/temp_upload.zip", FILE_WRITE);
     if (!uploadFile_) {
-      Serial.println("[TestInterface] Failed to open /temp_upload.zip for writing");
+      Serial.println("[TestInterface] temp_upload.zip open failed");
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    Serial.printf("[TestInterface] Upload WRITE %u bytes\n", (unsigned)upload.currentSize);
     if (uploadFile_) {
       uploadFile_.write(upload.buf, upload.currentSize);
     }
   } else if (upload.status == UPLOAD_FILE_END) {
-    Serial.printf("[TestInterface] Upload END, total %u bytes\n", (unsigned)upload.totalSize);
     if (!uploadFile_) return;
     uploadFile_.close();
 
@@ -81,20 +75,16 @@ void TestInterfaceServer::handleProjectUploadChunk() {
     if (!checkFile) return;
     size_t fileSize = checkFile.size();
     checkFile.close();
-    Serial.printf("[TestInterface] Staged zip is %u bytes on LittleFS\n", (unsigned)fileSize);
     if (fileSize < 100) {
       LittleFS.remove("/temp_upload.zip");
-      Serial.println("[TestInterface] Staged zip too small, aborting");
+      Serial.println("[TestInterface] zip too small");
       return;
     }
 
-    Serial.println("[TestInterface] Validating + extracting zip...");
-    bool ok = runValidateAndExtractOnDedicatedTask();
-    Serial.printf("[TestInterface] validateAndExtractZip() -> %s\n", ok ? "true" : "false");
+    bool ok = validateAndExtractZip();
 
     if (ok) {
       LittleFS.remove("/temp_upload.zip");
-      Serial.println("[TestInterface] Install succeeded, restarting in 2s");
       // Reboot to pick up the newly-installed /PROJECT/project.json fresh,
       // same convention as UnifiedConfigurator on the e-paper side - a
       // clean reload from scratch instead of trying to tear down and
@@ -105,7 +95,7 @@ void TestInterfaceServer::handleProjectUploadChunk() {
       ESP.restart();
     } else {
       LittleFS.remove("/temp_upload.zip");
-      Serial.println("[TestInterface] Install failed, not restarting");
+      Serial.println("[TestInterface] install failed");
     }
   }
 }
@@ -114,69 +104,22 @@ void TestInterfaceServer::handleProjectUploadComplete() {
   sendJSONResponse(true, "Processing upload...");
 }
 
-namespace {
-struct ExtractTaskContext {
-  TestInterfaceServer* self;
-  bool result;
-  SemaphoreHandle_t done;
-};
-
-void extractTaskEntry(void* param) {
-  ExtractTaskContext* ctx = (ExtractTaskContext*)param;
-  ctx->result = ctx->self->validateAndExtractZip();
-  xSemaphoreGive(ctx->done);
-  vTaskDelete(nullptr);
-}
-} // namespace
-
-bool TestInterfaceServer::runValidateAndExtractOnDedicatedTask() {
-  ExtractTaskContext ctx;
-  ctx.self = this;
-  ctx.result = false;
-  ctx.done = xSemaphoreCreateBinary();
-  if (!ctx.done) {
-    Serial.println("[TestInterface] Failed to create extraction semaphore, falling back to inline call");
-    return validateAndExtractZip();
-  }
-
-  // 40KB - generous headroom over the ~8KB tinfl_decompressor plus
-  // whatever else the zip-parsing/JSON-parsing call chain needs, without
-  // touching the loop task's own (deliberately modest, 32KB) stack that
-  // normal project loading depends on. See the header comment on this
-  // method's declaration for the diagnostic history behind this.
-  const uint32_t kStackWords = 40960 / sizeof(StackType_t);
-  TaskHandle_t taskHandle = nullptr;
-  BaseType_t created = xTaskCreate(extractTaskEntry, "zipExtract", kStackWords, &ctx, 1, &taskHandle);
-  if (created != pdPASS) {
-    Serial.println("[TestInterface] Failed to create extraction task, falling back to inline call");
-    vSemaphoreDelete(ctx.done);
-    return validateAndExtractZip();
-  }
-
-  // No sensible timeout shorter than "wait for it" here - a stuck
-  // extraction would need investigating on its own merits, not silently
-  // giving up and leaving the temp zip/task in an undefined state.
-  xSemaphoreTake(ctx.done, portMAX_DELAY);
-  vSemaphoreDelete(ctx.done);
-  return ctx.result;
-}
-
 bool TestInterfaceServer::validateAndExtractZip() {
   // Empty means the zip's project.json has no deviceId at all (older
   // export, or a non-project zip) - not proof it's wrong, so it isn't
   // rejected on that basis alone, matching UnifiedConfigurator's identical
   // reasoning on the e-paper side.
   String uploadedDeviceId = ProjectInstaller::peekProjectDeviceId("/temp_upload.zip");
-  Serial.printf("[TestInterface] peekProjectDeviceId() -> \"%s\"\n", uploadedDeviceId.c_str());
   if (!uploadedDeviceId.isEmpty() && uploadedDeviceId != DEVICE_ID) {
-    Serial.printf("[TestInterface] deviceId mismatch (expected \"%s\")\n", DEVICE_ID);
+    Serial.println("[TestInterface] deviceId mismatch");
     return false;
   }
 
   String error;
   bool ok = ProjectInstaller::installProjectZipFromFile("/temp_upload.zip", error);
   if (!ok) {
-    Serial.printf("[TestInterface] installProjectZipFromFile() error: %s\n", error.c_str());
+    Serial.println("[TestInterface] install error:");
+    Serial.println(error);
   }
   return ok;
 }
