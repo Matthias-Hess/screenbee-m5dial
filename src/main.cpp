@@ -1,11 +1,15 @@
-// Checkpoint 3: WiFi provisioning (WiFiSetupServer, a lean WiFi+MQTT-only
-// AP configurator - see its own header for why the full dual-purpose
-// UnifiedConfigurator wasn't ported as-is) + MQTT hello/status
-// (MqttClient, ported ~verbatim from MqttEPaperDisplay2 - LWT/status is
-// baked into its own connect(), nothing extra needed here). No saved
-// credentials, or a failed connect, enters AP setup mode automatically;
-// holding the push button for 3s while connected re-enters it. Once
-// connected, renders the checkpoint 2 test project same as before.
+// Checkpoint 4: live MQTT-driven redraw, on top of checkpoint 3's WiFi
+// provisioning (WiFiSetupServer, a lean WiFi+MQTT-only AP configurator -
+// see its own header for why the full dual-purpose UnifiedConfigurator
+// wasn't ported as-is) + MQTT hello/status (MqttClient, ported ~verbatim
+// from MqttEPaperDisplay2 - LWT/status is baked into its own connect(),
+// nothing extra needed here). No saved credentials, or a failed connect,
+// enters AP setup mode automatically; holding the push button for 3s while
+// connected re-enters it. Once connected, subscribes to every topic the
+// test project's objects are bound to and renders screen 0; from then on,
+// onMqttMessage() keeps whatever's on screen live - see its own comment
+// and docs/device-contract.md (designer repo) §3/§4 for the rendering-
+// parity/MQTT contract this ports from the e-paper firmware.
 #include <M5Dial.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -32,6 +36,19 @@ MqttClient mqttClient;
 bool setupModeActive = false;
 const unsigned long BUTTON_LONG_PRESS_MS = 3000;
 bool longPressTriggered = false;
+
+// Which screen is currently on the display - only ever 0 for now (no
+// button/encoder navigation wired up yet), but onMqttMessage() already
+// needs to know it to decide whether an incoming value affects what's
+// visible right now, so this is tracked from the start rather than
+// hardcoded, matching Application::currentScreenIndex_ in the e-paper
+// firmware.
+int currentScreenIndex = 0;
+// Mirrors Application::topicsSubscribed_ - subscribeToAllTopics() is a
+// no-op once this is true, so a project reload can force a clean
+// resubscribe by clearing it first (not done anywhere yet - only one
+// project load path exists today).
+bool topicsSubscribed = false;
 
 // Always overwrites (not "if missing") - these are bring-up fixtures that
 // change as object types get ported, not real persisted data; an
@@ -68,6 +85,95 @@ void blitCanvasToDisplay() {
   M5Dial.Display.endWrite();
 }
 
+// An object bound to a JSON subtopic stores "<topic>#<path>" in its own
+// properties.topic (see ProjectLoader::getTopicValue) - only the real
+// topic before "#" is ever valid to subscribe to at the broker, and MQTT
+// itself never delivers the "#path" suffix on an incoming message, so
+// every comparison against a live topic name needs this stripped first.
+// Mirrors Application::stripJsonPath() in the e-paper firmware exactly.
+String stripJsonPath(const String& topicOrPath) {
+  int hashIndex = topicOrPath.indexOf('#');
+  return hashIndex == -1 ? topicOrPath : topicOrPath.substring(0, hashIndex);
+}
+
+// Recurses into obj.children for parity with the e-paper firmware's
+// collectTopics() (tab-control -> panel nesting) even though nothing in
+// the M5 Dial DDF's supportedObjectTypes includes tab-control/panel yet -
+// children is always empty here today, but this stays correct for free
+// once that changes instead of silently missing nested topics again (see
+// hil/combinations.js's own header comment for the exact bug this caused
+// on the e-paper target the first time tab-control shipped).
+void collectTopics(const std::vector<ScreenObject>& objects, std::vector<String>& outTopics) {
+  for (const auto& obj : objects) {
+    if (!obj.properties.topic.isEmpty()) {
+      String realTopic = stripJsonPath(obj.properties.topic);
+      bool exists = false;
+      for (const auto& existing : outTopics) {
+        if (existing == realTopic) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists) outTopics.push_back(realTopic);
+    }
+    if (!obj.children.empty()) collectTopics(obj.children, outTopics);
+  }
+}
+
+// Subscribes to every topic used anywhere in the project (not just the
+// current screen) in one pass, same as the e-paper firmware - cheaper than
+// resubscribing on every screen switch, and MqttClient queues subscribe
+// calls made before a real connection exists for replay on the next
+// connect/reconnect, so call order relative to mqttClient.connect() doesn't
+// matter.
+void subscribeToAllTopics() {
+  if (topicsSubscribed) return;
+  if (!projectLoader.isLoaded()) return;
+
+  const ProjectConfig& project = projectLoader.getProject();
+  std::vector<String> topics;
+  for (const auto& screen : project.screens) {
+    collectTopics(screen.objects, topics);
+  }
+  if (!topics.empty()) mqttClient.subscribeToKeys(topics);
+  topicsSubscribed = true;
+}
+
+// Whether any object in this screen (or a nested child) is bound to `topic`
+// - decides if an incoming value is worth a redraw at all, since only the
+// currently-displayed screen is ever visible.
+bool screenUsesTopic(const std::vector<ScreenObject>& objects, const String& topic) {
+  for (const auto& obj : objects) {
+    if (!obj.properties.topic.isEmpty() && stripJsonPath(obj.properties.topic) == topic) return true;
+    if (!obj.children.empty() && screenUsesTopic(obj.children, topic)) return true;
+  }
+  return false;
+}
+
+// The core of Checkpoint 4: an incoming MQTT value updates the project's
+// topic-value cache and, if the current screen actually displays it,
+// triggers a full renderScreen() + blit. No partial-update path exists
+// here (unlike the e-paper firmware's renderObjectsPartial) - a color LCD
+// has no e-paper ghosting/refresh-time concern to optimize around, so a
+// full redraw on every relevant change is simple and cheap enough.
+void onMqttMessage(const String& topic, const String& payload) {
+  if (!projectLoader.isLoaded()) return;
+  projectLoader.setTopicValue(topic, payload);
+
+  const ProjectConfig& project = projectLoader.getProject();
+  if (currentScreenIndex < 0 || currentScreenIndex >= (int)project.screens.size()) return;
+  const Screen& screen = project.screens[currentScreenIndex];
+  if (!screenUsesTopic(screen.objects, topic)) return;
+
+  if (!screenRenderer) return;
+  if (!screenRenderer->renderScreen(currentScreenIndex)) {
+    Serial.println("[M5Dial] renderScreen() failed during MQTT-triggered redraw");
+    return;
+  }
+  blitCanvasToDisplay();
+  Serial.printf("[M5Dial] Redrew screen %d after MQTT update on \"%s\"\n", currentScreenIndex, topic.c_str());
+}
+
 void loadAndRenderProject() {
   if (!projectLoader.loadProject("/test_project.json")) {
     Serial.println("[M5Dial] Failed to load test project");
@@ -76,8 +182,13 @@ void loadAndRenderProject() {
   Serial.printf("[M5Dial] Loaded project \"%s\" with %d screen(s)\n",
                 projectLoader.getProject().name.c_str(), projectLoader.getProject().screens.size());
 
+  currentScreenIndex = 0;
+  mqttClient.clearSubscriptions();
+  topicsSubscribed = false;
+  subscribeToAllTopics();
+
   if (!screenRenderer) screenRenderer = new ColorScreenRenderer(projectLoader, &canvas);
-  if (!screenRenderer->renderScreen(0)) {
+  if (!screenRenderer->renderScreen(currentScreenIndex)) {
     Serial.println("[M5Dial] renderScreen(0) failed");
     return;
   }
@@ -103,6 +214,7 @@ void setupMQTT() {
     mqttClient.configure("", 0, "", "");
   }
   mqttClient.setConnectedCallback([]() { publishHello(); });
+  mqttClient.setCallback(onMqttMessage);
   mqttClient.connect();
 }
 
@@ -150,7 +262,7 @@ void setup() {
   M5Dial.Display.setBrightness(150);
 
   Serial.begin(115200);
-  Serial.println("[M5Dial] Checkpoint 3 - WiFi provisioning + MQTT hello/status");
+  Serial.println("[M5Dial] Checkpoint 4 - live MQTT-driven redraw");
 
   if (!LittleFS.begin(true)) {
     Serial.println("[M5Dial] LittleFS mount failed");
