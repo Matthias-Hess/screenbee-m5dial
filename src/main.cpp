@@ -1,4 +1,6 @@
-// Checkpoint 4: live MQTT-driven redraw, on top of checkpoint 3's WiFi
+// Checkpoint 5: HIL test-interface HTTP endpoints (TestInterfaceServer -
+// project upload, forced screen switch, snapshot, topic-value readback),
+// on top of checkpoint 4's live MQTT-driven redraw and checkpoint 3's WiFi
 // provisioning (WiFiSetupServer, a lean WiFi+MQTT-only AP configurator -
 // see its own header for why the full dual-purpose UnifiedConfigurator
 // wasn't ported as-is) + MQTT hello/status (MqttClient, ported ~verbatim
@@ -6,10 +8,11 @@
 // nothing extra needed here). No saved credentials, or a failed connect,
 // enters AP setup mode automatically; holding the push button for 3s while
 // connected re-enters it. Once connected, subscribes to every topic the
-// test project's objects are bound to and renders screen 0; from then on,
-// onMqttMessage() keeps whatever's on screen live - see its own comment
-// and docs/device-contract.md (designer repo) §3/§4 for the rendering-
-// parity/MQTT contract this ports from the e-paper firmware.
+// loaded project's objects are bound to, renders screen 0, and starts the
+// test interface server; from then on, onMqttMessage() keeps whatever's on
+// screen live - see its own comment and docs/device-contract.md (designer
+// repo) §3/§4/§6 for the rendering-parity/MQTT/testInterface contract this
+// ports from the e-paper firmware.
 #include <M5Dial.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -23,6 +26,7 @@
 #include "M5DisplayAdapter.h"
 #include "WiFiSetupServer.h"
 #include "MqttClient.h"
+#include "TestInterfaceServer.h"
 
 ClippedCanvas16 canvas(240, 240);
 ProjectLoader projectLoader;
@@ -32,6 +36,7 @@ ConfigManager configManager;
 M5DisplayAdapter displayAdapter;
 WiFiSetupServer wifiSetupServer(displayAdapter, configManager);
 MqttClient mqttClient;
+TestInterfaceServer testInterfaceServer(&canvas);
 
 bool setupModeActive = false;
 const unsigned long BUTTON_LONG_PRESS_MS = 3000;
@@ -175,12 +180,19 @@ void onMqttMessage(const String& topic, const String& payload) {
 }
 
 void loadAndRenderProject() {
-  if (!projectLoader.loadProject("/test_project.json")) {
-    Serial.println("[M5Dial] Failed to load test project");
+  // A project uploaded via TestInterfaceServer's POST /api/project lands at
+  // /PROJECT/project.json (ProjectLoader::loadProject's own default path,
+  // matching the e-paper firmware's convention) and takes priority over the
+  // built-in bring-up fixture once one exists - it persists across reboots
+  // (LittleFS, not wiped by writeTestProject()/writeTestAssets()), same as
+  // on the e-paper side.
+  String projectPath = LittleFS.exists("/PROJECT/project.json") ? "/PROJECT/project.json" : "/test_project.json";
+  if (!projectLoader.loadProject(projectPath)) {
+    Serial.printf("[M5Dial] Failed to load project from %s\n", projectPath.c_str());
     return;
   }
-  Serial.printf("[M5Dial] Loaded project \"%s\" with %d screen(s)\n",
-                projectLoader.getProject().name.c_str(), projectLoader.getProject().screens.size());
+  Serial.printf("[M5Dial] Loaded project \"%s\" with %d screen(s) from %s\n",
+                projectLoader.getProject().name.c_str(), projectLoader.getProject().screens.size(), projectPath.c_str());
 
   currentScreenIndex = 0;
   mqttClient.clearSubscriptions();
@@ -194,6 +206,23 @@ void loadAndRenderProject() {
   }
   blitCanvasToDisplay();
   Serial.println("[M5Dial] Rendered screen 0 to display");
+}
+
+// POST /api/screen's handler (see TestInterfaceServer::setScreenSwitchHandler)
+// - forces a full render of an arbitrary screen index without reloading the
+// project or rebooting, so a HIL orchestrator can exercise every screen from
+// one upload cheaply. Always a full render, never anything that would depend
+// on whatever was on screen before, so repeated snapshots are reproducible.
+bool handleTestScreenSwitch(int index) {
+  if (!projectLoader.isLoaded()) return false;
+  const ProjectConfig& project = projectLoader.getProject();
+  if (index < 0 || index >= (int)project.screens.size()) return false;
+  if (!screenRenderer) return false;
+
+  currentScreenIndex = index;
+  if (!screenRenderer->renderScreen(index)) return false;
+  blitCanvasToDisplay();
+  return true;
 }
 
 void publishHello() {
@@ -245,6 +274,16 @@ void setupWiFi() {
       setupModeActive = false;
       setupMQTT();
       loadAndRenderProject();
+
+      testInterfaceServer.setScreenSwitchHandler(handleTestScreenSwitch);
+      testInterfaceServer.setGetTopicValueHandler([](const String& topic) {
+        return projectLoader.getTopicValue(topic);
+      });
+      if (testInterfaceServer.start()) {
+        Serial.printf("[M5Dial] Test interface server listening on http://%s/\n", creds.lastIP.c_str());
+      } else {
+        Serial.println("[M5Dial] Test interface server failed to start");
+      }
       return;
     }
     Serial.println("[M5Dial] WiFi connect failed, entering setup mode");
@@ -262,7 +301,7 @@ void setup() {
   M5Dial.Display.setBrightness(150);
 
   Serial.begin(115200);
-  Serial.println("[M5Dial] Checkpoint 4 - live MQTT-driven redraw");
+  Serial.println("[M5Dial] Checkpoint 5 - HIL test-interface endpoints");
 
   if (!LittleFS.begin(true)) {
     Serial.println("[M5Dial] LittleFS mount failed");
@@ -296,6 +335,7 @@ void loop() {
   }
 
   mqttClient.loop();
+  testInterfaceServer.handleClient();
 
   // Hold the push button 3s to re-enter setup mode (e.g. to change
   // WiFi/MQTT settings) without a full reflash.
