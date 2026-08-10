@@ -7,6 +7,21 @@ const char* WiFiSetupServer::AP_PASSWORD = "screenbee12345";
 const IPAddress WiFiSetupServer::AP_IP(192, 168, 4, 1);
 const IPAddress WiFiSetupServer::AP_GATEWAY(192, 168, 4, 1);
 const IPAddress WiFiSetupServer::AP_SUBNET(255, 255, 255, 0);
+const unsigned long WiFiSetupServer::AP_AUTO_RESET_MS = 120000;  // 2 minutes
+
+// Set by the WiFi.onEvent() handler below (ensureWiFiEventLogging(), a
+// free function, not a WiFiSetupServer member - see its own comment for
+// why it's registered lazily as a plain global callback) and read by
+// tick(). A bare global rather than an instance member because there's
+// only ever one WiFiSetupServer (wifiSetupServer in main.cpp) and the
+// event callback has no way to reach a specific instance - matches this
+// codebase's existing convention for other single-instance globals
+// (configManager, mqttClient). Reset to false at the top of every AP-mode
+// entry (startAP()/start()'s AP branch) so a *second* setup-mode session
+// within the same boot doesn't inherit a stale "someone connected"
+// verdict from the first one - true state as of the current AP session,
+// not "ever, across this whole boot".
+static bool s_apClientConnected = false;
 
 WiFiSetupServer::WiFiSetupServer(IDisplay& display, IConfigStorage& config)
   : display_(display), config_(config), webServer_(nullptr), running_(false), apMode_(false) {}
@@ -30,6 +45,7 @@ void ensureWiFiEventLogging() {
   WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
     if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
       Serial.println("[WiFiSetupServer] AP: station connected");
+      s_apClientConnected = true;
     } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
       Serial.println("[WiFiSetupServer] AP: station disconnected");
     } else if (event == ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED) {
@@ -61,6 +77,9 @@ bool WiFiSetupServer::start() {
       return false;
     }
     Serial.println("[WiFiSetupServer] WiFi.softAP() succeeded");
+    s_apClientConnected = false;
+    apEnteredAtMs_ = millis();
+    lastRenderedCountdownState_ = -1;
   } else {
     WiFi.mode(WIFI_AP_STA);
   }
@@ -79,7 +98,9 @@ bool WiFiSetupServer::start() {
 
   if (apMode_) {
     Serial.println("[WiFiSetupServer] calling showSetupScreenAP()");
-    showSetupScreenAP();
+    int initialSecondsLeft = (int)(AP_AUTO_RESET_MS / 1000);
+    showSetupScreenAP(initialSecondsLeft, false);
+    lastRenderedCountdownState_ = initialSecondsLeft;
   } else {
     showSetupScreenSTA();
   }
@@ -98,6 +119,8 @@ bool WiFiSetupServer::startAP() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
   if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) return false;
+  s_apClientConnected = false;
+  apEnteredAtMs_ = millis();
 
   webServer_ = new WebServer(80);
   webServer_->on("/", HTTP_GET, [this]() { handleRoot(); });
@@ -108,7 +131,9 @@ bool WiFiSetupServer::startAP() {
   webServer_->onNotFound([this]() { handleNotFound(); });
   webServer_->begin();
 
-  showSetupScreenAP();
+  int initialSecondsLeft = (int)(AP_AUTO_RESET_MS / 1000);
+  showSetupScreenAP(initialSecondsLeft, false);
+  lastRenderedCountdownState_ = initialSecondsLeft;
   running_ = true;
   return true;
 }
@@ -128,7 +153,42 @@ void WiFiSetupServer::handleClient() {
   if (running_ && webServer_) webServer_->handleClient();
 }
 
-void WiFiSetupServer::showSetupScreenAP() {
+bool WiFiSetupServer::tick() {
+  if (!running_ || !apMode_) return false;
+
+  if (s_apClientConnected) {
+    if (lastRenderedCountdownState_ != -2) {
+      showSetupScreenAP(-1, true);
+      lastRenderedCountdownState_ = -2;
+    }
+    return false;
+  }
+
+  unsigned long elapsed = millis() - apEnteredAtMs_;
+  if (elapsed >= AP_AUTO_RESET_MS) return true;
+
+  int secondsLeft = (int)((AP_AUTO_RESET_MS - elapsed) / 1000);
+  if (secondsLeft != lastRenderedCountdownState_) {
+    showSetupScreenAP(secondsLeft, false);
+    lastRenderedCountdownState_ = secondsLeft;
+  }
+  return false;
+}
+
+// clientConnected true overrides secondsLeft entirely (once a client has
+// connected during this AP session, the countdown is dead regardless of
+// its actual remaining value - see tick()'s own comment). secondsLeft -1
+// with clientConnected false suppresses the status line altogether (the
+// two no-argument call sites this used to have before tick() existed -
+// showSetupScreenSTA() has no equivalent status line at all, e.g.).
+void WiFiSetupServer::showSetupScreenAP(int secondsLeft, bool clientConnected) {
+  String statusLine;
+  if (clientConnected) {
+    statusLine = "1 client connected";
+  } else if (secondsLeft >= 0) {
+    statusLine = "Auto-reset in " + String(secondsLeft) + "s";
+  }
+
   display_.showLines({
     "SCREENBEE SETUP",
     "",
@@ -138,6 +198,9 @@ void WiFiSetupServer::showSetupScreenAP() {
     "",
     "2. Open browser:",
     "http://192.168.4.1",
+    "",
+    statusLine,
+    "Press button to cancel",
   });
 }
 

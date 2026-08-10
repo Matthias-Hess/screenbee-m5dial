@@ -43,8 +43,30 @@ MqttClient mqttClient;
 TestInterfaceServer testInterfaceServer(&canvas);
 
 bool setupModeActive = false;
-const unsigned long BUTTON_LONG_PRESS_MS = 3000;
-bool longPressTriggered = false;
+
+// Entering setup mode used to be a plain 3s button hold - easy to trigger
+// by accident (e.g. an absent-minded long press while wearing the device)
+// and, once in, the only way back out was a physical power-cycle (nothing
+// ever cleared setupModeActive - see the button-press-exit handling in
+// loop() below for the other half of that fix). Replaced 2026-08-10 with
+// a deliberate compound gesture: hold the button, then rotate the dial
+// left by SETUP_GESTURE_CLICKS clicks, then right by the same amount
+// (relative to wherever the left phase ended, not back to the exact
+// start) - nobody bumps a button and spins a dial in a specific two-phase
+// pattern by accident. M5Dial.Encoder.read() returns raw quadrature
+// increments, not "clicks" - SETUP_GESTURE_CLICK_INCREMENTS is an
+// estimate (this dial's detents felt like ~3-4 increments each during
+// testing), tune it if the gesture triggers too early/late on real
+// hardware. Which physical rotation direction counts as "left" (negative
+// vs positive delta) hasn't been hardware-verified either - if the
+// gesture never registers, try swapping which phase requires a negative
+// vs positive delta below.
+const long SETUP_GESTURE_CLICK_INCREMENTS = 4;
+const long SETUP_GESTURE_CLICKS = 3;
+const long SETUP_GESTURE_THRESHOLD = SETUP_GESTURE_CLICK_INCREMENTS * SETUP_GESTURE_CLICKS;
+long setupGestureStartEncoderPos = 0;
+long setupGestureMinDelta = 0;
+bool setupGestureWentLeft = false;
 
 // Which screen is currently on the display - only ever 0 for now (no
 // button/encoder navigation wired up yet), but onMqttMessage() already
@@ -364,6 +386,30 @@ void loop() {
       delay(1000);
       ESP.restart();
     }
+    // A plain button press (not another 3s hold) cancels setup mode and
+    // returns to normal operation - previously the only way out was a
+    // physical power-cycle/reset, since nothing here ever cleared
+    // setupModeActive. Goes through the same clean-reboot path every
+    // other setup-mode exit already uses (see the credentials-configured
+    // branch above and TestInterfaceServer::stop()'s own comment on why
+    // this codebase prefers a fresh boot over tearing down/rebuilding
+    // live AP/WebServer/WiFi state mid-request) rather than trying to
+    // resume live.
+    if (M5Dial.BtnA.wasPressed()) {
+      Serial.println("[M5Dial] Button pressed in setup mode, cancelling and restarting");
+      displayAdapter.showLines({"Cancelled.", "Rebooting..."});
+      delay(1000);
+      ESP.restart();
+    }
+    // No one connected to the AP within 2 minutes - see
+    // WiFiSetupServer::tick()'s own comment. Only fires in AP mode (a
+    // no-op elsewhere), so this is safe to call unconditionally here.
+    if (wifiSetupServer.tick()) {
+      Serial.println("[M5Dial] No AP client connected within the timeout, restarting");
+      displayAdapter.showLines({"No connection.", "Rebooting..."});
+      delay(1000);
+      ESP.restart();
+    }
     delay(10);
     return;
   }
@@ -371,12 +417,27 @@ void loop() {
   mqttClient.loop();
   testInterfaceServer.handleClient();
 
-  // Hold the push button 3s to re-enter setup mode (e.g. to change
-  // WiFi/MQTT settings) without a full reflash.
-  if (M5Dial.BtnA.pressedFor(BUTTON_LONG_PRESS_MS)) {
-    if (!longPressTriggered) {
-      longPressTriggered = true;
-      Serial.println("[M5Dial] Long press detected, entering AP setup mode");
+  // Hold the push button, then rotate the dial left (~3 clicks) then
+  // right (~3 clicks, measured from wherever the left phase ended) to
+  // re-enter setup mode - see this gesture's own header comment (top of
+  // file) for why it replaced a plain 3s hold.
+  if (M5Dial.BtnA.wasPressed()) {
+    setupGestureStartEncoderPos = M5Dial.Encoder.read();
+    setupGestureMinDelta = 0;
+    setupGestureWentLeft = false;
+  }
+
+  if (M5Dial.BtnA.isPressed()) {
+    long delta = M5Dial.Encoder.read() - setupGestureStartEncoderPos;
+    if (delta < setupGestureMinDelta) setupGestureMinDelta = delta;
+
+    if (!setupGestureWentLeft && setupGestureMinDelta <= -SETUP_GESTURE_THRESHOLD) {
+      setupGestureWentLeft = true;
+      Serial.println("[M5Dial] Setup gesture: left phase detected, turn right to confirm");
+    }
+
+    if (setupGestureWentLeft && (delta - setupGestureMinDelta) >= SETUP_GESTURE_THRESHOLD) {
+      Serial.println("[M5Dial] Setup gesture completed, entering AP setup mode");
       // Must release port 80 before wifiSetupServer.startAP() binds its
       // own WebServer there - see TestInterfaceServer::stop()'s own
       // comment for what silently broke without this.
@@ -384,8 +445,9 @@ void loop() {
       setupModeActive = true;
       wifiSetupServer.startAP();
     }
-  } else if (M5Dial.BtnA.isReleased()) {
-    longPressTriggered = false;
+  } else if (M5Dial.BtnA.wasReleased()) {
+    setupGestureMinDelta = 0;
+    setupGestureWentLeft = false;
   }
 
   delay(10);
