@@ -36,6 +36,12 @@ bool TestInterfaceServer::start() {
   return true;
 }
 
+void TestInterfaceServer::stop() {
+  if (!serverRunning_) return;
+  webServer_->stop();
+  serverRunning_ = false;
+}
+
 void TestInterfaceServer::handleClient() {
   if (serverRunning_) {
     webServer_->handleClient();

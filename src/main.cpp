@@ -377,6 +377,10 @@ void loop() {
     if (!longPressTriggered) {
       longPressTriggered = true;
       Serial.println("[M5Dial] Long press detected, entering AP setup mode");
+      // Must release port 80 before wifiSetupServer.startAP() binds its
+      // own WebServer there - see TestInterfaceServer::stop()'s own
+      // comment for what silently broke without this.
+      testInterfaceServer.stop();
       setupModeActive = true;
       wifiSetupServer.startAP();
     }

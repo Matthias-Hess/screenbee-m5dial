@@ -28,6 +28,22 @@ public:
   // own guard, same reasoning (nothing useful to serve without an IP to
   // reach it on).
   bool start();
+
+  // Releases the port-80 WebServer entirely (not just "stop calling
+  // handleClient()") - must be called before WiFiSetupServer::startAP()
+  // (re-entering setup mode via the long-press, main.cpp's loop()) tries
+  // to bind its own WebServer(80). Without this, both servers hold a
+  // listening socket on the same port simultaneously; only
+  // wifiSetupServer's gets serviced once setupModeActive is true (see
+  // loop()'s own branch), so any TCP connection that happens to land on
+  // this server's still-bound-but-never-serviced socket just hangs until
+  // the client gives up - found 2026-08-10 as the real cause of
+  // AP-setup-mode page loads failing with ERR_CONNECTION_ABORTED on real
+  // hardware (multiple phones, same result - not a client-side or WiFi
+  // radio coexistence issue as first suspected). Safe to call even if
+  // never started.
+  void stop();
+
   void handleClient();
   bool isRunning() const { return serverRunning_; }
 
