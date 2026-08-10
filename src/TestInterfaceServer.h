@@ -121,4 +121,15 @@ private:
   // config only takes effect on the next boot (setupMQTT() only runs from
   // setup()).
   void handleMqttConfigure();
+
+  // GET /ddf.zip - this device's own Device Description File, embedded
+  // verbatim in the firmware (ddf_zip.h, generated from the designer
+  // repo's public/ddf/m5stack-m5dial.ddf.zip - regenerate that header
+  // whenever the DDF changes). Lets the designer's device-scan-section.tsx
+  // fetch+cache a device's DDF directly from a live device instead of
+  // needing it pre-curated - the same "announced device" flow the e-paper
+  // firmware already supports (its own hello carries ddfVersion+url
+  // pointing at an equivalent endpoint). publishHello() (main.cpp) is what
+  // actually advertises this URL; this handler just needs to serve it.
+  void handleDdfZip();
 };

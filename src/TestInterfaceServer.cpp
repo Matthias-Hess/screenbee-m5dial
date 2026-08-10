@@ -5,6 +5,7 @@
 #include "DeviceInfo.h"
 #include "project/ProjectInstaller.h"
 #include "config/ConfigManager.h"
+#include "ddf_zip.h"
 
 // The single global ConfigManager instance (main.cpp) - see
 // handleMqttConfigure()'s own comment for why this server reaches into it
@@ -30,6 +31,7 @@ bool TestInterfaceServer::start() {
   webServer_->on("/snapshot.bmp", HTTP_GET, [this]() { this->handleSnapshot(); });
   webServer_->on("/api/topic-values", HTTP_GET, [this]() { this->handleGetTopicValues(); });
   webServer_->on("/api/mqtt", HTTP_POST, [this]() { this->handleMqttConfigure(); });
+  webServer_->on("/ddf.zip", HTTP_GET, [this]() { this->handleDdfZip(); });
 
   webServer_->begin();
   serverRunning_ = true;
@@ -328,4 +330,13 @@ void TestInterfaceServer::handleMqttConfigure() {
   } else {
     sendJSONResponse(false, "Failed to save MQTT configuration");
   }
+}
+
+void TestInterfaceServer::handleDdfZip() {
+  // send_P(), not send() - the zip's raw bytes contain embedded 0x00s
+  // throughout, and every send() overload takes a null-terminated
+  // String/const char* with no explicit length, which would silently
+  // truncate at the first one. Only send_P()'s 4-arg overload accepts an
+  // explicit content length.
+  webServer_->send_P(200, "application/zip", (const char*)DDF_ZIP, sizeof(DDF_ZIP));
 }

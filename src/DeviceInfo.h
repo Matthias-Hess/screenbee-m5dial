@@ -12,11 +12,15 @@
 // see what's running - not parsed/compared against anything.
 #define FIRMWARE_VERSION "0.1.0"
 
-// No DDF_VERSION/url in "hello" yet - unlike the e-paper firmware, this
-// device doesn't serve its own DDF over HTTP yet (that's tied to
-// checkpoint 4's self-deploy work, which is also when a stale-DDF-version
-// check would first matter). Add both once that exists - advertising a
-// version with nothing to fetch would be worse than not advertising one.
+// Must match public/ddf/m5stack-m5dial.ddf.zip's own device.json
+// "ddfVersion" exactly (2026-08-10) - announced in "hello" alongside a
+// GET /ddf.zip URL (TestInterfaceServer::handleDdfZip(), serving
+// ddf_zip.h - regenerate that header whenever the DDF file changes) so
+// the designer's device-scan-section.tsx can fetch+cache this device's
+// DDF straight from a live device, matching the e-paper firmware's own
+// "announced device" support. Bump this whenever the DDF changes so a
+// stale cached copy gets refetched.
+#define DDF_VERSION "1.1"
 
 // The MQTT topic namespace every device/browser participant in the deploy
 // flow shares (screenbee/<clientId>/...) - same shared protocol as every

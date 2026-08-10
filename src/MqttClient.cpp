@@ -25,6 +25,26 @@ MqttClient::MqttClient()
   // Must be set before connect() - PubSubClient allocates the buffer at
   // that size up front, so this belongs here at construction, not later.
   mqttClient_.setBufferSize(1024);
+
+  // PubSubClient's default 15s keepalive (docs/device-contract.md's
+  // shared broker also runs a dozen+ other MQTT clients, e.g. Home
+  // Assistant's mqttthing integrations, all configured with a 60s
+  // keepalive) made this device far more sensitive to any transient
+  // broker/network hiccup than everything else on the same broker -
+  // found 2026-08-10 as the real cause of a live-published MQTT message
+  // (a deploy trigger, specifically) intermittently never reaching this
+  // device at all: `mosquitto` logs showed it reconnecting every ~5-15s
+  // fairly continuously, meaning it spent a meaningful fraction of time
+  // in a disconnected gap where nothing could be delivered. A message
+  // published *while already connected* could land in exactly that gap
+  // and simply never arrive - the same trigger DOES eventually get
+  // through if the device (or its connection) resets, since the trigger
+  // is retained and gets redelivered on the next successful subscribe,
+  // which is what made this look like "works after a manual reset,
+  // silently drops otherwise" rather than a clean pass/fail. Matching the
+  // other clients' 60s keepalive gives this device the same tolerance for
+  // brief hiccups they already have.
+  mqttClient_.setKeepAlive(60);
 }
 
 void MqttClient::configure(const String& host, uint16_t port, const String& username, const String& password) {
@@ -179,6 +199,19 @@ void MqttClient::loop() {
     if (!mqttClient_.connected()) {
       unsigned long now = millis();
       if (now - lastReconnectAttempt_ > RECONNECT_INTERVAL_MS) {
+        // Temporary diagnostic (2026-08-10): this device was found
+        // reconnecting to the broker roughly every 5s continuously
+        // (matching RECONNECT_INTERVAL_MS exactly), which explains why a
+        // live-published MQTT message (e.g. a deploy trigger) so often
+        // failed to reach it - it was almost never in a stable, long-lived
+        // connected state. PubSubClient::state() reports why *it* thinks
+        // the connection is down (MQTT_CONNECTION_TIMEOUT=-4 means a
+        // PINGREQ went unanswered, MQTT_CONNECTION_LOST=-3 means the
+        // underlying socket read failed, etc. - see PubSubClient.h's own
+        // #defines). Logged right here (throttled to the same cadence as
+        // the reconnect attempt itself), not on every loop() iteration,
+        // to avoid flooding the log while waiting out the throttle.
+        Serial.printf("[MqttClient] Disconnected, PubSubClient state=%d\n", mqttClient_.state());
         lastReconnectAttempt_ = now;
         reconnect();
       }

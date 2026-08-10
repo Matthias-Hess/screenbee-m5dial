@@ -27,9 +27,13 @@
 #include "WiFiSetupServer.h"
 #include "MqttClient.h"
 #include "TestInterfaceServer.h"
+#include "DeployManager.h"
 #ifdef JTAG_DEBUG_TEST
 #include "project/ProjectInstaller.h"
 #include "test_deflate_zip.h"
+#endif
+#ifdef POWER_STATE_TEST
+#include <esp_sleep.h>
 #endif
 
 ClippedCanvas16 canvas(240, 240);
@@ -41,6 +45,7 @@ M5DisplayAdapter displayAdapter;
 WiFiSetupServer wifiSetupServer(displayAdapter, configManager);
 MqttClient mqttClient;
 TestInterfaceServer testInterfaceServer(&canvas);
+DeployManager deployManager;
 
 bool setupModeActive = false;
 
@@ -67,6 +72,16 @@ const long SETUP_GESTURE_THRESHOLD = SETUP_GESTURE_CLICK_INCREMENTS * SETUP_GEST
 long setupGestureStartEncoderPos = 0;
 long setupGestureMinDelta = 0;
 bool setupGestureWentLeft = false;
+
+// Auto-sleep (backlight + WiFi off) after IDLE_SLEEP_MS with no button
+// press or encoder movement - see enterIdleSleep()/wakeFromIdleSleep()'s
+// own comments. 2 minutes (2026-08-10, tuned down from an initial 20 -
+// confirmed working end-to-end on real hardware first, then shortened
+// per feedback that 20 was too long in practice).
+const unsigned long IDLE_SLEEP_MS = 2UL * 60UL * 1000UL;
+unsigned long lastActivityMs = 0;
+bool deviceSleeping = false;
+long lastEncoderPosForIdle = 0;
 
 // Which screen is currently on the display - only ever 0 for now (no
 // button/encoder navigation wired up yet), but onMqttMessage() already
@@ -187,7 +202,40 @@ bool screenUsesTopic(const std::vector<ScreenObject>& objects, const String& top
 // here (unlike the e-paper firmware's renderObjectsPartial) - a color LCD
 // has no e-paper ghosting/refresh-time concern to optimize around, so a
 // full redraw on every relevant change is simple and cheap enough.
+// Set by onMqttMessage(), consumed by loop() right after mqttClient.loop()
+// returns - see onMqttMessage()'s own comment for why the actual deploy
+// handling can't happen from inside the MQTT callback itself.
+bool pendingDeploy = false;
+String pendingDeployPayload;
+
 void onMqttMessage(const String& topic, const String& payload) {
+  // Device-level control topic, not a project-data topic - route it to
+  // DeployManager instead of falling through to setTopicValue() below,
+  // which would otherwise try to treat the deploy JSON payload as a
+  // literal displayed value for a (nonexistent) object bound to this
+  // topic string.
+  //
+  // Deliberately deferred, not handled inline: this callback runs nested
+  // inside PubSubClient's own loop()/packet-parsing call stack, and
+  // DeployManager::handleDeployMessage() calls mqttClient.publish()
+  // roughly a hundred times in a row (one per download-progress percent).
+  // PubSubClient's publish() and its incoming-packet parsing share one
+  // internal buffer - found 2026-08-10 on real hardware: every publish()
+  // call here looked successful (returned/logged normally) but a
+  // third-party MQTT subscriber watching the broker directly never saw a
+  // single deploy-status message arrive, consistent with those outgoing
+  // packets getting corrupted by writing into a buffer the still-in-
+  // progress incoming-message processing also owns. Setting a flag here
+  // and doing the real work from loop() - after mqttClient.loop() has
+  // fully returned and PubSubClient's own call stack has fully unwound -
+  // sidesteps the reentrancy entirely.
+  String deployTopic = String(TOPIC_PREFIX) + "/" + mqttClient.getClientId() + "/deploy";
+  if (topic == deployTopic) {
+    pendingDeployPayload = payload;
+    pendingDeploy = true;
+    return;
+  }
+
   if (!projectLoader.isLoaded()) return;
   projectLoader.setTopicValue(topic, payload);
 
@@ -255,10 +303,43 @@ void publishHello() {
   JsonDocument doc;
   doc["deviceId"] = DEVICE_ID;
   doc["firmwareVersion"] = FIRMWARE_VERSION;
+  // ddfVersion+url - see DeviceInfo.h's DDF_VERSION comment. Without
+  // these, device-scan-section.tsx deliberately treats this as "older/
+  // simpler firmware that doesn't announce a DDF" and skips it entirely -
+  // found 2026-08-10 as why this device never showed up under "Announced
+  // Devices" despite hello/status already working fine for the Deploy
+  // dialog (which only needs deviceId, a lower bar than DDF discovery).
+  doc["ddfVersion"] = DDF_VERSION;
+  doc["url"] = "http://" + WiFi.localIP().toString() + "/ddf.zip";
   String payload;
   serializeJson(doc, payload);
   mqttClient.publish(String(TOPIC_PREFIX) + "/" + mqttClient.getClientId() + "/hello", payload, true);
   Serial.println("[M5Dial] Published hello");
+}
+
+// screenbee/<clientId>/deploy-status - see DeployManager.h's own header
+// comment for the full flow this reports on. Not retained (matches
+// docs/device-contract.md §4's contract text: unlike deploy/hello/status,
+// deploy-status is never called "retained" there) - it's a point-in-time
+// progress event stream, not a persistent flag a late subscriber should
+// see stale.
+void publishDeployStatus(const String& deployId, const String& state, const String& error, int percent) {
+  JsonDocument doc;
+  doc["deployId"] = deployId;
+  doc["state"] = state;
+  if (!error.isEmpty()) doc["error"] = error;
+  if (percent >= 0) doc["percent"] = percent;
+  String payload;
+  serializeJson(doc, payload);
+  bool ok = mqttClient.publish(String(TOPIC_PREFIX) + "/" + mqttClient.getClientId() + "/deploy-status", payload, false);
+  Serial.printf("[M5Dial] publish(deploy-status) -> %s: %s\n", ok ? "true" : "FALSE", payload.c_str());
+}
+
+// Clears the retained screenbee/<clientId>/deploy trigger - see
+// DeployManager.h's own comment for why this is the actual fix for the
+// reboot loop found 2026-08-10, not just tidiness.
+void clearDeployTrigger() {
+  mqttClient.publish(String(TOPIC_PREFIX) + "/" + mqttClient.getClientId() + "/deploy", "", true);
 }
 
 void setupMQTT() {
@@ -268,6 +349,20 @@ void setupMQTT() {
   } else {
     mqttClient.configure("", 0, "", "");
   }
+  deployManager.setPublishStatusHandler(publishDeployStatus);
+  deployManager.setClearTriggerHandler(clearDeployTrigger);
+  // Subscribed once here, not from the connected-callback - MqttClient::
+  // connect() already re-subscribes everything in its own subscribedTopics_
+  // on every reconnect (see its own comment), same mechanism
+  // subscribeToAllTopics() already relies on for project-bound topics.
+  // NOTE: this subscription gets silently wiped moments later by
+  // loadAndRenderProject()'s clearSubscriptions() call (see setupWiFi()'s
+  // own comment on its re-subscribe right after that call, right below in
+  // this same function's caller) - kept here too, not just there, so
+  // connect()'s subscribedTopics_-replay-on-reconnect still has the right
+  // topic queued from the very first connection attempt onward, before
+  // loadAndRenderProject() has even run once.
+  mqttClient.subscribe(String(TOPIC_PREFIX) + "/" + mqttClient.getClientId() + "/deploy");
   mqttClient.setConnectedCallback([]() { publishHello(); });
   mqttClient.setCallback(onMqttMessage);
   mqttClient.connect();
@@ -302,6 +397,23 @@ void setupWiFi() {
                      creds.mqttHost.c_str(), creds.mqttPort, creds.mqttUsername.c_str());
       setupMQTT();
       loadAndRenderProject();
+      // Re-subscribe to the deploy topic - loadAndRenderProject() just
+      // called mqttClient.clearSubscriptions() (to drop the *previous*
+      // project's own topic subscriptions before subscribeToAllTopics()
+      // adds the new project's) - clearSubscriptions() has no concept of
+      // "device-level" vs "project-content" topics, so it silently wiped
+      // the deploy subscription setupMQTT() had just established a moment
+      // earlier too. Found 2026-08-10 as the real reason a *live*-
+      // published deploy trigger so often never reached this device at
+      // all: it was only ever actually listening on `deploy` for the
+      // brief window between setupMQTT()'s subscribe and this line - long
+      // enough to usually catch a *retained* trigger already waiting
+      // (arrives essentially with the SUBACK), but not a genuinely live
+      // one published later while the device sat there, subscribed to
+      // nothing, looking completely normal otherwise (a manual reset
+      // "fixed" it because that's exactly what re-opens the same brief
+      // catch window with the trigger still retained on the broker).
+      mqttClient.subscribe(String(TOPIC_PREFIX) + "/" + mqttClient.getClientId() + "/deploy");
 
       testInterfaceServer.setScreenSwitchHandler(handleTestScreenSwitch);
       testInterfaceServer.setGetTopicValueHandler([](const String& topic) {
@@ -322,6 +434,133 @@ void setupWiFi() {
   wifiSetupServer.start();
   Serial.println("[M5Dial] wifiSetupServer.start() returned");
 }
+
+#ifdef POWER_STATE_TEST
+// env:m5dial_powertest only (-DPOWER_STATE_TEST) - cycles through display
+// (and, since 2026-08-10, radio) power states forever, each held long
+// enough to get a stable multimeter reading. Built because the actual
+// goal turned out to be "turn the screen off (and ideally the radio too)
+// at night in the camper", not battery-life-driven deep sleep - deep
+// sleep is a poor fit anyway (the rotary encoder is wired to GPIO 40/41,
+// outside the ESP32-S3's RTC GPIO range (0-21), so it can't serve as a
+// deep-sleep wake source; only the push button, on GPIO 21, could).
+//
+// States 1-3 deliberately never touch WiFi, isolating what the display
+// alone costs (measured 2026-08-10: 40 / 25 / 19 mA @ 12V):
+//   1. Normal        - full brightness, panel awake.
+//   2. Backlight off  - panel driver still fully powered/active.
+//   3. Panel sleep    - Display.sleep() (backlight off + GC9A01 SLPIN).
+//
+// States 4-6 connect WiFi for real (reusing saved credentials, same as
+// normal operation) to answer a follow-up question states 1-3 can't:
+// leaving WiFi/MQTT running (as normal operation always does) while just
+// dimming the screen doesn't address radio-off/EMF concerns at all - only
+// an explicit WiFi.mode(WIFI_OFF) does, and that's worth knowing the real
+// cost and reconnect latency of before building it into real behavior:
+//   4. WiFi connected, normal display - real "both on" baseline, and logs
+//      how long the initial connect actually took.
+//   5. WiFi connected, backlight off - what "just dim it" really costs in
+//      real operation (radio stays fully active the whole time).
+//   6. WiFi off (explicit disconnect + mode(WIFI_OFF)), backlight off,
+//      CPU fully awake (no sleep - encoder/button stay instantly
+//      responsive) - the actual candidate for "dark and radio-quiet".
+//      Reconnects WiFi again at the end of this state and logs exactly
+//      how long that took.
+//
+// State 7, light sleep, runs LAST, after WiFi is already off from state 6
+// - esp_light_sleep_start() (CPU clock-gated, not powered down like deep
+// sleep - can still wake from any GPIO, encoder included, unlike deep
+// sleep) was found 2026-08-10 to drop the USB-CDC connection on this
+// hardware (the host-side serial monitor goes silent through it and
+// doesn't resume without manually reopening the port) - running it last
+// keeps every earlier state's log output watchable live across a whole
+// cycle without that interruption landing mid-cycle. No deep sleep state
+// at all - the encoder can't wake it, and power draw wasn't the actual
+// problem being solved.
+void runPowerStateTest() {
+  const unsigned long HOLD_MS = 20000;
+
+  // ConfigManager::loadWiFiCredentials() reads from LittleFS - normal
+  // setup() mounts it before anything WiFi-related runs, but this test is
+  // called from setup() *before* that point (deliberately, to skip the
+  // rest of normal init entirely). Without this, every credentials load
+  // below silently failed and states 5-7 were skipped every cycle -
+  // found 2026-08-10 on the very first real hardware run of this test.
+  if (!LittleFS.begin(true)) {
+    Serial.println("[PowerTest] LittleFS mount failed - radio states will be skipped");
+  }
+
+  auto connectWiFiForTest = [](const char* label) -> bool {
+    WiFiCredentials creds;
+    if (!configManager.loadWiFiCredentials(creds) || creds.ssid.isEmpty()) {
+      Serial.println("[PowerTest] No saved WiFi credentials - skipping radio states");
+      return false;
+    }
+    unsigned long start = millis();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(creds.ssid.c_str(), creds.password.c_str());
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 30000) {
+      delay(100);
+    }
+    unsigned long elapsedMs = millis() - start;
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[PowerTest] %s: WiFi connected in %lums\n", label, elapsedMs);
+      return true;
+    }
+    Serial.printf("[PowerTest] %s: WiFi did NOT connect within %lums\n", label, elapsedMs);
+    return false;
+  };
+
+  while (true) {
+    Serial.println("[PowerTest] === 1. NORMAL (backlight full, panel awake, WiFi off) ===");
+    M5Dial.Display.wakeup();
+    M5Dial.Display.setBrightness(150);
+    delay(HOLD_MS);
+
+    Serial.println("[PowerTest] === 2. BACKLIGHT OFF (panel still awake, WiFi off) ===");
+    M5Dial.Display.setBrightness(0);
+    delay(HOLD_MS);
+
+    Serial.println("[PowerTest] === 3. PANEL SLEEP (backlight off + GC9A01 SLPIN, WiFi off) ===");
+    M5Dial.Display.sleep();
+    delay(HOLD_MS);
+    M5Dial.Display.wakeup();
+
+    Serial.println("[PowerTest] === 4. WiFi CONNECTED, NORMAL display ===");
+    M5Dial.Display.setBrightness(150);
+    bool wifiUp = connectWiFiForTest("State 4 connect");
+    delay(HOLD_MS);
+
+    if (wifiUp) {
+      Serial.println("[PowerTest] === 5. WiFi CONNECTED, BACKLIGHT OFF ===");
+      M5Dial.Display.setBrightness(0);
+      delay(HOLD_MS);
+
+      Serial.println("[PowerTest] === 6. WiFi OFF, BACKLIGHT OFF, CPU awake ===");
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      delay(HOLD_MS);
+
+      unsigned long reconnectStart = millis();
+      connectWiFiForTest("State 6 wake-reconnect");
+      Serial.printf("[PowerTest] Total dark-to-data-flowing time: %lums\n", millis() - reconnectStart);
+    }
+
+    // Light sleep last - found 2026-08-10 that it drops the USB-CDC
+    // connection on this hardware (the host-side serial monitor goes
+    // silent and doesn't resume without manually reopening it), so
+    // running it last keeps every earlier state's log output watchable
+    // live without an interruption to work around mid-cycle.
+    Serial.println("[PowerTest] === 7. LIGHT SLEEP (CPU clock-gated, WiFi off) ===");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    M5Dial.Display.setBrightness(0);
+    esp_sleep_enable_timer_wakeup(HOLD_MS * 1000ULL);
+    esp_light_sleep_start();
+    Serial.println("[PowerTest] Woke from light sleep, cycle repeating");
+  }
+}
+#endif
 
 #ifdef JTAG_DEBUG_TEST
 // JTAG-only (env:m5dial_debug + -DJTAG_DEBUG_TEST): reproduces the
@@ -347,6 +586,35 @@ void runJtagDebugTest() {
 }
 #endif
 
+// Idle-sleep: backlight only, after IDLE_SLEEP_MS of no button/encoder
+// activity, restored instantly on the next press or turn. WiFi/MQTT
+// deliberately stay up the whole time (2026-08-10, changed from an
+// earlier version that also turned the radio off) - the device needs to
+// stay reachable for MQTT-driven redraws and, concretely, MQTT self-
+// deploy: the `deploy` trigger is only delivered while actually
+// connected, so a radio-off sleep meant a deploy just sat unprocessed
+// until something happened to wake the device, which looked from the
+// designer's side like the deploy had silently done nothing. A screen
+// that's dark but still fully live (WiFi/MQTT/HTTP all normal, redraws
+// still happen into the framebuffer even while unlit) trades a small
+// amount of extra power for actually being remotely usable - see
+// hil/README.md's M5 Dial section (designer repo) / this file's own
+// earlier history for the power figures if that tradeoff ever needs
+// revisiting. No ESP32 sleep mode involved either way - the CPU stays
+// fully awake throughout, so M5Dial.update()/button/encoder polling in
+// loop() never stops.
+void enterIdleSleep() {
+  Serial.println("[M5Dial] Idle timeout - backlight off (WiFi/MQTT stay up)");
+  deviceSleeping = true;
+  M5Dial.Display.setBrightness(0);
+}
+
+void wakeFromIdleSleep() {
+  Serial.println("[M5Dial] Activity detected - backlight on");
+  deviceSleeping = false;
+  M5Dial.Display.setBrightness(150);
+}
+
 void setup() {
   auto cfg = M5.config();
   M5Dial.begin(cfg, /*enableEncoder=*/true, /*enableRFID=*/false);
@@ -354,6 +622,11 @@ void setup() {
 
   Serial.begin(115200);
   Serial.println("[M5Dial] Checkpoint 5 - HIL test-interface endpoints");
+
+#ifdef POWER_STATE_TEST
+  runPowerStateTest();  // never returns
+  return;
+#endif
 
   if (!LittleFS.begin(true)) {
     Serial.println("[M5Dial] LittleFS mount failed");
@@ -371,6 +644,9 @@ void setup() {
   Serial.println("[M5Dial] Calling setupWiFi()");
   setupWiFi();
   Serial.println("[M5Dial] setupWiFi() returned, setup() complete");
+
+  lastActivityMs = millis();
+  lastEncoderPosForIdle = M5Dial.Encoder.read();
 }
 
 void loop() {
@@ -414,7 +690,34 @@ void loop() {
     return;
   }
 
+  // Auto-sleep tracking - see enterIdleSleep()/wakeFromIdleSleep()'s own
+  // comments. "Activity" is deliberately limited to a button press or an
+  // encoder movement, not a background MQTT-driven redraw - presence of
+  // new data isn't presence of a person. Unlike this feature's first
+  // version, sleeping no longer skips mqttClient.loop()/
+  // testInterfaceServer.handleClient() below at all - WiFi/MQTT/HTTP stay
+  // fully live through a "sleep", only the backlight actually changes.
+  long currentEncoderPosForIdle = M5Dial.Encoder.read();
+  bool userActivity = M5Dial.BtnA.wasPressed() || (currentEncoderPosForIdle != lastEncoderPosForIdle);
+  lastEncoderPosForIdle = currentEncoderPosForIdle;
+
+  if (userActivity) {
+    lastActivityMs = millis();
+    if (deviceSleeping) wakeFromIdleSleep();
+  } else if (!deviceSleeping && millis() - lastActivityMs >= IDLE_SLEEP_MS) {
+    enterIdleSleep();
+  }
+
   mqttClient.loop();
+
+  // Handled here, not inside onMqttMessage() itself - see that function's
+  // own comment for why. mqttClient.loop() above has fully returned by
+  // this point, so DeployManager's own publish() calls are safe.
+  if (pendingDeploy) {
+    pendingDeploy = false;
+    deployManager.handleDeployMessage(pendingDeployPayload);
+  }
+
   testInterfaceServer.handleClient();
 
   // Hold the push button, then rotate the dial left (~3 clicks) then
