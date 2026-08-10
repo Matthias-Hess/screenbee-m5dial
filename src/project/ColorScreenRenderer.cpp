@@ -214,8 +214,17 @@ bool ColorScreenRenderer::renderLabel(const ScreenObject& obj) {
 }
 
 bool ColorScreenRenderer::renderBox(const ScreenObject& obj) {
+  // fillColor, not backgroundColor - box's own fill is a distinct property
+  // from backgroundColor (used by label/MqttDataField's text-box
+  // background), matching render-box.ts's identical `obj.properties.
+  // fillColor` read on the designer side and ObjectProperties.fillColor's
+  // own "Color of filled portion" field. Reading backgroundColor here
+  // instead (defaulting to opaque "#ffffff" per parseObjectProperties())
+  // meant every box with a border rendered a white interior no matter what
+  // fillColor actually said, never transparent even when fillColor was
+  // never set at all - found 2026-08-10 building the M5 Dial HIL fixture.
   bool fillTransparent = false;
-  uint16_t fillColor = parseHexColor(obj.properties.backgroundColor, &fillTransparent);
+  uint16_t fillColor = parseHexColor(obj.properties.fillColor, &fillTransparent);
   bool strokeTransparent = false;
   uint16_t strokeColor = parseHexColor(obj.properties.strokeColor, &strokeTransparent);
   int strokeWidth = obj.properties.strokeWidth;

@@ -1,5 +1,26 @@
 #include "ProjectLoader.h"
 
+namespace {
+// Every asset path stored in project.json (icon `path`, SoftwareButton
+// `pathNormal`/`pathActive`, MQTTIconField `valueIconPairs[].path`, a
+// screen's flattened-background `path`) is written by the designer's
+// export pipeline (lib/project-zip.ts) relative to the *zip root* (e.g.
+// "assets/icon-lock.bmp") - the same convention e-paper's own export uses.
+// ProjectInstaller::installProjectZipFromFile() always installs every zip
+// entry under "/PROJECT/" (e.g. "/PROJECT/assets/icon-lock.bmp"), but
+// nothing was ever prefixing these path fields to match before they
+// reached ColorAssetLoader::drawBMPToCanvas() (a literal LittleFS.open()
+// on whatever string it's given) - every icon/SoftwareButton/MQTTIconField
+// silently fell into its own "asset missing" black-square placeholder,
+// found 2026-08-10 building the M5 Dial HIL fixture (both a plain `icon`
+// and an MQTTIconField rendered as solid black squares instead of their
+// real bitmaps - the *load failure* fallback, not a pixel-content bug).
+String resolveAssetPath(const String& path) {
+  if (path.isEmpty() || path.charAt(0) == '/') return path;
+  return "/PROJECT/" + path;
+}
+}  // namespace
+
 ProjectLoader::ProjectLoader() : loaded_(false) {}
 
 bool ProjectLoader::loadProject(const String& projectPath) {
@@ -28,8 +49,21 @@ bool ProjectLoader::parseJSONFromFile(File& file) {
   // Parse directly from file stream to avoid loading entire JSON into memory
   size_t fileSize = file.size();
   size_t bufferSize = fileSize * 3 / 2;  // 1.5x file size
-  if (bufferSize < 32768) bufferSize = 32768;
-  
+  // Floor was 32768 - an arbitrary "reasonable minimum" that had nothing to
+  // do with what ArduinoJson actually needs for a small project, and on
+  // this specific hardware, ESP.getMaxAllocHeap() at this point in boot
+  // (right after WiFi connects, before this call) is a *deterministic*
+  // 31732 bytes - not fragmentation noise, the same exact number across
+  // every boot measured (2026-08-10, building the M5 Dial HIL fixture).
+  // A 32768 floor is unconditionally 1036 bytes above that ceiling, so it
+  // failed EVERY project load on this device, regardless of actual project
+  // size - even a 598-byte fixture with a single box object. 4096 is still
+  // generous slack over the 1.5x-of-actual-file-size estimate for anything
+  // this floor could plausibly matter for (a tiny-but-deeply-nested
+  // project), while leaving ~27KB of margin under the real ceiling instead
+  // of exceeding it.
+  if (bufferSize < 4096) bufferSize = 4096;
+
   // Check if we have enough memory
   if (ESP.getMaxAllocHeap() < bufferSize) {
     Serial.printf("[ProjectLoader] Not enough contiguous heap to load %s (need %u, have %u)\n",
@@ -56,7 +90,9 @@ bool ProjectLoader::parseJSON(const String& jsonContent) {
   // Allocate sufficient memory for large project files with many objects
   // For 66KB JSON file, we need ~100KB buffer (1.5x rule of thumb)
   size_t bufferSize = jsonContent.length() * 3 / 2;
-  if (bufferSize < 32768) bufferSize = 32768;  // Minimum 32KB
+  // See parseJSONFromFile()'s identical fix (2026-08-10) for why this floor
+  // was lowered from 32768 - it broke every project load on this hardware.
+  if (bufferSize < 4096) bufferSize = 4096;
   
   // Suppress deprecation warning - DynamicJsonDocument is still the correct choice
   // for large, variable-sized JSON in ArduinoJson 7
@@ -161,7 +197,7 @@ void ProjectLoader::parseScreens(JsonArray screensArray) {
     Screen screen;
     screen.id = screenJson["id"] | "";
     screen.name = screenJson["name"] | "";
-    screen.path = screenJson["path"] | "";
+    screen.path = resolveAssetPath(screenJson["path"] | "");
     screen.backgroundColor = screenJson["backgroundColor"] | "#ffffff";
 
     if (screenJson["objects"].is<JsonArray>()) {
@@ -193,9 +229,9 @@ ScreenObject ProjectLoader::parseScreenObject(JsonObject objJson) {
   obj.width = objJson["width"] | 0;
   obj.height = objJson["height"] | 0;
   obj.zIndex = objJson["zIndex"] | 0;
-  obj.path = objJson["path"] | "";
-  obj.pathNormal = objJson["pathNormal"] | "";
-  obj.pathActive = objJson["pathActive"] | "";
+  obj.path = resolveAssetPath(objJson["path"] | "");
+  obj.pathNormal = resolveAssetPath(objJson["pathNormal"] | "");
+  obj.pathActive = resolveAssetPath(objJson["pathActive"] | "");
 
   if (objJson["properties"].is<JsonObject>()) {
     obj.properties = parseObjectProperties(objJson["properties"]);
@@ -308,7 +344,7 @@ std::vector<ValueIconPair> ProjectLoader::parseValueIconPairs(JsonArray pairsArr
     // getIconPathForValue()'s own valueStr.toFloat() already does.
     pair.value = pairJson["value"].as<String>().toFloat();
     pair.thenShowIcon = pairJson["thenShowIcon"] | "";
-    pair.path = pairJson["path"] | "";
+    pair.path = resolveAssetPath(pairJson["path"] | "");
     
     pairs.push_back(pair);
   }

@@ -179,6 +179,42 @@ void useDictReservingAllocator(mz_zip_archive& zip) {
   zip.m_pRealloc = dictReservingRealloc;
 }
 
+// mz_zip_reader_init_mem() needs the ENTIRE zip file sitting in one
+// contiguous heap block up front (the previous approach here: malloc(
+// zipSize) + read the whole file into it). That's fine for the tiny test
+// zips this was originally verified against, but a real exported project
+// (fonts/icons, tens of KB) routinely exceeds what a single malloc can get
+// on this device - confirmed 2026-08-10 building the M5 Dial HIL fixture:
+// a 21KB zip failed ("Out of memory reading zip") once the device was
+// actually running normally (project loaded, MQTT connected, canvas
+// drawn) even though the *same size* zip installed fine right after a
+// fresh boot - this board has no PSRAM at all (internal SRAM only), so
+// there's no "just allocate more" fix, only "stop needing one big
+// allocation in the first place."
+//
+// mz_zip_reader_init() (the callback-based variant, as opposed to
+// _init_mem()) reads the archive through a caller-supplied m_pRead
+// function instead, in small on-demand chunks (central directory entries,
+// then each file's compressed bytes during extraction) - no upper bound on
+// zip size beyond LittleFS itself. The source zip File has to stay open
+// for the whole call (miniz seeks around it non-sequentially while parsing
+// the central directory), unlike the old malloc-then-close-immediately
+// pattern.
+struct ZipFileReadContext {
+  File* file;
+};
+
+size_t zipFileReadCallback(void* opaque, mz_uint64 fileOfs, void* pBuf, size_t n) {
+  ZipFileReadContext* ctx = (ZipFileReadContext*)opaque;
+  if (!ctx->file->seek((uint32_t)fileOfs)) return 0;
+  return ctx->file->read((uint8_t*)pBuf, n);
+}
+
+void useStreamingReader(mz_zip_archive& zip, ZipFileReadContext& ctx) {
+  zip.m_pRead = zipFileReadCallback;
+  zip.m_pIO_opaque = &ctx;
+}
+
 namespace ProjectInstaller {
 
 String peekProjectDeviceId(const String& zipPath) {
@@ -186,26 +222,21 @@ String peekProjectDeviceId(const String& zipPath) {
   if (!zipFile) return "";
 
   size_t zipSize = zipFile.size();
-  uint8_t* zipData = (uint8_t*)malloc(zipSize);
-  if (!zipData) {
-    zipFile.close();
-    return "";
-  }
-  zipFile.readBytes((char*)zipData, zipSize);
-  zipFile.close();
+  ZipFileReadContext readCtx{&zipFile};
 
   mz_zip_archive zip;
   memset(&zip, 0, sizeof(zip));
   useDictReservingAllocator(zip);
-  if (!mz_zip_reader_init_mem(&zip, zipData, zipSize, 0)) {
-    free(zipData);
+  useStreamingReader(zip, readCtx);
+  if (!mz_zip_reader_init(&zip, zipSize, 0)) {
+    zipFile.close();
     return "";
   }
 
   mz_uint32 fileIndex = 0;
   if (!mz_zip_reader_locate_file_v2(&zip, "project.json", nullptr, 0, &fileIndex)) {
     mz_zip_reader_end(&zip);
-    free(zipData);
+    zipFile.close();
     return "";
   }
 
@@ -213,7 +244,7 @@ String peekProjectDeviceId(const String& zipPath) {
   memset(&fileStat, 0, sizeof(fileStat));
   if (!mz_zip_reader_file_stat(&zip, fileIndex, &fileStat)) {
     mz_zip_reader_end(&zip);
-    free(zipData);
+    zipFile.close();
     return "";
   }
 
@@ -227,7 +258,7 @@ String peekProjectDeviceId(const String& zipPath) {
   uint8_t* jsonData = (uint8_t*)malloc(jsonSize);
   if (!jsonData) {
     mz_zip_reader_end(&zip);
-    free(zipData);
+    zipFile.close();
     return "";
   }
 
@@ -245,7 +276,7 @@ String peekProjectDeviceId(const String& zipPath) {
   }
 
   mz_zip_reader_end(&zip);
-  free(zipData);
+  zipFile.close();
 
   if (!extractOk) {
     free(jsonData);
@@ -281,20 +312,14 @@ bool installProjectZipFromFile(const String& zipPath, String& errorOut) {
   }
 
   size_t zipSize = zipFile.size();
-  uint8_t* zipData = (uint8_t*)malloc(zipSize);
-  if (!zipData) {
-    zipFile.close();
-    errorOut = "Out of memory reading zip";
-    return false;
-  }
-  zipFile.readBytes((char*)zipData, zipSize);
-  zipFile.close();
+  ZipFileReadContext readCtx{&zipFile};
 
   mz_zip_archive zip;
   memset(&zip, 0, sizeof(zip));
   useDictReservingAllocator(zip);
-  if (!mz_zip_reader_init_mem(&zip, zipData, zipSize, 0)) {
-    free(zipData);
+  useStreamingReader(zip, readCtx);
+  if (!mz_zip_reader_init(&zip, zipSize, 0)) {
+    zipFile.close();
     errorOut = "Invalid zip archive";
     return false;
   }
@@ -360,7 +385,7 @@ bool installProjectZipFromFile(const String& zipPath, String& errorOut) {
   }
 
   mz_zip_reader_end(&zip);
-  free(zipData);
+  zipFile.close();
 
   if (!success) {
     errorOut = "Zip extraction failed";

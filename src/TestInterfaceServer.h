@@ -47,13 +47,6 @@ public:
   // hil/README.md's "combo 0 immediately after a fresh upload" writeup).
   void setGetTopicValueHandler(std::function<String(const String&)> handler) { getTopicValueHandler_ = handler; }
 
-  // Public only so the free-function FreeRTOS task trampoline in
-  // TestInterfaceServer.cpp's anonymous namespace can call it across the
-  // task boundary (see runValidateAndExtractOnDedicatedTask()'s comment) -
-  // not meant as a general external entry point, still an implementation
-  // detail of the upload flow.
-  bool validateAndExtractZip();
-
 private:
   ClippedCanvas16* canvas_;
   WebServer* webServer_;
@@ -66,6 +59,8 @@ private:
   File uploadFile_;
 
   void sendJSONResponse(bool success, const String& message);
+
+  bool validateAndExtractZip();
 
   // POST /api/project - multipart-zip upload (uploadContentType in the DDF's
   // testInterface). Two-phase like every WebServer file upload: the upload
@@ -95,4 +90,19 @@ private:
   // query params, matching DisplaySnapshot::handleGetTopicValues exactly -
   // WebServer's arg() only returns the last value for a repeated key.
   void handleGetTopicValues();
+
+  // POST /api/mqtt - form-urlencoded protocol/host/port/username/password,
+  // same field names and save-to-WiFiCredentials logic as
+  // WiFiSetupServer::handleMqttConfigure(), added here (2026-08-10) so a
+  // HIL client - or anyone reconfiguring the broker - doesn't depend on
+  // the AP setup page being reachable at all. That page requires
+  // WiFi.mode(WIFI_AP_STA) (AP + STA sharing one radio, a known ESP32
+  // coexistence sharp edge) and was observed dropping in-flight page loads
+  // (ERR_CONNECTION_ABORTED, station connect/disconnect flapping in the
+  // serial log) while this device was otherwise running completely
+  // normally - not something this always-on server depends on at all. No
+  // restart-on-save, same as the AP setup page's own behavior - the new
+  // config only takes effect on the next boot (setupMQTT() only runs from
+  // setup()).
+  void handleMqttConfigure();
 };

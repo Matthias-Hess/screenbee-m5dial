@@ -4,6 +4,12 @@
 #include <ArduinoJson.h>
 #include "DeviceInfo.h"
 #include "project/ProjectInstaller.h"
+#include "config/ConfigManager.h"
+
+// The single global ConfigManager instance (main.cpp) - see
+// handleMqttConfigure()'s own comment for why this server reaches into it
+// directly instead of going through WiFiSetupServer.
+extern ConfigManager configManager;
 
 TestInterfaceServer::TestInterfaceServer(ClippedCanvas16* canvas, uint16_t port)
   : canvas_(canvas), port_(port), serverRunning_(false) {
@@ -23,6 +29,7 @@ bool TestInterfaceServer::start() {
   webServer_->on("/api/screen", HTTP_POST, [this]() { this->handleScreenSwitch(); });
   webServer_->on("/snapshot.bmp", HTTP_GET, [this]() { this->handleSnapshot(); });
   webServer_->on("/api/topic-values", HTTP_GET, [this]() { this->handleGetTopicValues(); });
+  webServer_->on("/api/mqtt", HTTP_POST, [this]() { this->handleMqttConfigure(); });
 
   webServer_->begin();
   serverRunning_ = true;
@@ -284,4 +291,35 @@ void TestInterfaceServer::handleGetTopicValues() {
   String output;
   serializeJson(doc, output);
   webServer_->send(200, "application/json", output);
+}
+
+void TestInterfaceServer::handleMqttConfigure() {
+  if (!webServer_->hasArg("protocol") || !webServer_->hasArg("host") || !webServer_->hasArg("port")) {
+    sendJSONResponse(false, "Missing MQTT protocol, host, or port");
+    return;
+  }
+  String protocol = webServer_->arg("protocol");
+  String host = webServer_->arg("host");
+  int port = webServer_->arg("port").toInt();
+  String username = webServer_->arg("username");
+  String password = webServer_->arg("password");
+
+  if (port <= 0 || port > 65535) {
+    sendJSONResponse(false, "Invalid port number");
+    return;
+  }
+
+  WiFiCredentials creds;
+  configManager.loadWiFiCredentials(creds);  // ok to fail - WiFi is already up, so credentials already exist; only MQTT fields are being overwritten below
+  creds.mqttProtocol = protocol;
+  creds.mqttHost = host;
+  creds.mqttPort = port;
+  creds.mqttUsername = username;
+  creds.mqttPassword = password;
+
+  if (configManager.saveWiFiCredentials(creds)) {
+    sendJSONResponse(true, "MQTT configuration saved - reboot to apply");
+  } else {
+    sendJSONResponse(false, "Failed to save MQTT configuration");
+  }
 }

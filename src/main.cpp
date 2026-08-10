@@ -276,6 +276,8 @@ void setupWiFi() {
       configManager.saveWiFiCredentials(creds);
       Serial.printf("[M5Dial] WiFi connected: %s (%d dBm)\n", creds.lastIP.c_str(), creds.lastRSSI);
       setupModeActive = false;
+      Serial.printf("[M5Dial] MQTT config: host=\"%s\" port=%d user=\"%s\"\n",
+                     creds.mqttHost.c_str(), creds.mqttPort, creds.mqttUsername.c_str());
       setupMQTT();
       loadAndRenderProject();
 
