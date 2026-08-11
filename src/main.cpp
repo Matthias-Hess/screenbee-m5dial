@@ -6,13 +6,17 @@
 // wasn't ported as-is) + MQTT hello/status (MqttClient, ported ~verbatim
 // from MqttEPaperDisplay2 - LWT/status is baked into its own connect(),
 // nothing extra needed here). No saved credentials, or a failed connect,
-// enters AP setup mode automatically; holding the push button for 3s while
-// connected re-enters it. Once connected, subscribes to every topic the
-// loaded project's objects are bound to, renders screen 0, and starts the
-// test interface server; from then on, onMqttMessage() keeps whatever's on
-// screen live - see its own comment and docs/device-contract.md (designer
-// repo) §3/§4/§6 for the rendering-parity/MQTT/testInterface contract this
-// ports from the e-paper firmware.
+// enters AP setup mode automatically; a project-configured "Go to Setup
+// Mode" button (see ButtonAction's own comment in ProjectTypes.h) or the
+// hardcoded rear-button fallback (loop(), bottom of file) re-enters it once
+// connected. Once connected, subscribes to every topic the loaded
+// project's objects are bound to, renders screen 0, and starts the test
+// interface server; from then on, onMqttMessage() keeps whatever's on
+// screen live, and touch/button input runs through dispatchButtonAction()
+// (SoftwareButton hit-testing, front-button press) - see those functions'
+// own comments and docs/device-contract.md (designer repo) §3/§4/§6 for the
+// rendering-parity/MQTT/testInterface contract this ports from the e-paper
+// firmware.
 #include <M5Dial.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -49,29 +53,23 @@ DeployManager deployManager;
 
 bool setupModeActive = false;
 
-// Entering setup mode used to be a plain 3s button hold - easy to trigger
-// by accident (e.g. an absent-minded long press while wearing the device)
-// and, once in, the only way back out was a physical power-cycle (nothing
-// ever cleared setupModeActive - see the button-press-exit handling in
-// loop() below for the other half of that fix). Replaced 2026-08-10 with
-// a deliberate compound gesture: hold the button, then rotate the dial
-// left by SETUP_GESTURE_CLICKS clicks, then right by the same amount
-// (relative to wherever the left phase ended, not back to the exact
-// start) - nobody bumps a button and spins a dial in a specific two-phase
-// pattern by accident. M5Dial.Encoder.read() returns raw quadrature
-// increments, not "clicks" - SETUP_GESTURE_CLICK_INCREMENTS is an
-// estimate (this dial's detents felt like ~3-4 increments each during
-// testing), tune it if the gesture triggers too early/late on real
-// hardware. Which physical rotation direction counts as "left" (negative
-// vs positive delta) hasn't been hardware-verified either - if the
-// gesture never registers, try swapping which phase requires a negative
-// vs positive delta below.
-const long SETUP_GESTURE_CLICK_INCREMENTS = 4;
-const long SETUP_GESTURE_CLICKS = 3;
-const long SETUP_GESTURE_THRESHOLD = SETUP_GESTURE_CLICK_INCREMENTS * SETUP_GESTURE_CLICKS;
-long setupGestureStartEncoderPos = 0;
-long setupGestureMinDelta = 0;
-bool setupGestureWentLeft = false;
+// Entering setup mode used to be a plain 3s button hold, then (2026-08-10)
+// a hold+rotate-left-then-right compound gesture on the front button - both
+// replaced the same day by two cleaner mechanisms once "hold + rotate" was
+// wanted for a *different* purpose (adjusting a value on screen), which
+// would have collided with the gesture claiming that same input:
+//   1. A "Go to Setup Mode" ButtonAction (see ProjectTypes.h's ButtonAction
+//      comment) - assignable in the designer to the front button (btn-2)
+//      or any SoftwareButton, dispatched like any other button action via
+//      dispatchButtonAction() below. Makes setup-mode entry a visible,
+//      project-configured feature instead of a hidden gesture.
+//   2. A hardcoded rear-button (GPIO0) fallback - see its own handling in
+//      loop() - guarantees a way in even with no project loaded or no
+//      button configured for it, without depending on any project config.
+// setupModeActive is cleared the same way it always was: nothing here
+// clears it live, every exit path (credentials configured, button-press
+// cancel, AP timeout) goes through ESP.restart() - see loop()'s
+// setupModeActive branch.
 
 // Auto-sleep (backlight + WiFi off) after IDLE_SLEEP_MS with no button
 // press or encoder movement - see enterIdleSleep()/wakeFromIdleSleep()'s
@@ -83,18 +81,44 @@ unsigned long lastActivityMs = 0;
 bool deviceSleeping = false;
 long lastEncoderPosForIdle = 0;
 
-// Which screen is currently on the display - only ever 0 for now (no
-// button/encoder navigation wired up yet), but onMqttMessage() already
-// needs to know it to decide whether an incoming value affects what's
-// visible right now, so this is tracked from the start rather than
-// hardcoded, matching Application::currentScreenIndex_ in the e-paper
-// firmware.
+// Encoder-detent dispatch for btn-0 ("Rotate Left")/btn-1 ("Rotate Right") -
+// the DDF declares these as configurable hardware buttons (same
+// name/defaultAction/screen-override machinery as btn-2 "Push", editable
+// identically in the designer's Hardware Buttons settings), but nothing
+// ever dispatched an action for them - only btn-2 (a real physical switch)
+// got wired to dispatchButtonAction() when this session built that
+// function. M5Dial.Encoder.read() returns raw quadrature increments, not
+// "clicks" - reusing the same ~4-increments-per-detent estimate the old
+// (now-removed) setup gesture used. Which physical direction is positive
+// vs negative hasn't been hardware-verified - btn-1 is assigned to
+// positive delta (guessed as "clockwise = right") here; swap the two
+// branches below if left/right come out backwards on real hardware.
+const long ENCODER_CLICK_INCREMENTS = 4;
+long lastDispatchedEncoderPos = 0;
+
+// Which screen is currently on the display - changed by dispatchButtonAction()
+// (next-screen/previous-screen/goto-screen) since 2026-08-10, previously
+// only ever 0 (no navigation wired up yet). onMqttMessage() needs to know
+// it to decide whether an incoming value affects what's visible right now,
+// matching Application::currentScreenIndex_ in the e-paper firmware.
 int currentScreenIndex = 0;
 // Mirrors Application::topicsSubscribed_ - subscribeToAllTopics() is a
 // no-op once this is true, so a project reload can force a clean
 // resubscribe by clearing it first (not done anywhere yet - only one
 // project load path exists today).
 bool topicsSubscribed = false;
+
+// Id of the SoftwareButton currently held down by touch (empty = none) -
+// drives which button renders pathActive this frame, and which one's
+// action fires on release, only if the release point is still over this
+// same button (drag-off-to-cancel, see loop()'s touch handling).
+String pressedSoftButtonId = "";
+// Set at touch-down, read at touch-up (a different loop() iteration, often
+// many frames later - can't be a per-frame local) - true if THIS press is
+// the one that woke the device from idle sleep, so its eventual release
+// won't also fire the button's action. See loop()'s own comment for why
+// this only applies to touch, not the front/rear buttons.
+bool suppressPressedButtonAction = false;
 
 // Always overwrites (not "if missing") - these are bring-up fixtures that
 // change as object types get ported, not real persisted data; an
@@ -615,6 +639,72 @@ void wakeFromIdleSleep() {
   M5Dial.Display.setBrightness(150);
 }
 
+// Shared by the "goto-setup-mode" ButtonAction (dispatchButtonAction()
+// below) and the hardcoded rear-button fallback (loop()) - both need the
+// exact same teardown/entry sequence TestInterfaceServer::stop()'s own
+// comment explains (release port 80 before WiFiSetupServer::startAP()
+// binds its own WebServer there).
+void enterSetupMode() {
+  Serial.println("[M5Dial] Entering setup mode");
+  testInterfaceServer.stop();
+  setupModeActive = true;
+  wifiSetupServer.startAP();
+}
+
+// Runs a ButtonAction the same way regardless of source (front button
+// btn-2, a SoftwareButton touch) - one dispatch function, not two parallel
+// ones, matching the designer's own preview-mode comment (project-
+// editor.tsx's handlePreviewButtonAction) that this was always meant to
+// mirror. Empty type = nothing configured, silently does nothing (a
+// SoftwareButton with no action, or a btn-2 with no default/override, is a
+// valid, common configuration - not an error).
+void dispatchButtonAction(const ButtonAction& action) {
+  if (action.type.isEmpty()) return;
+  if (!projectLoader.isLoaded()) return;
+
+  if (action.type == "next-screen" || action.type == "previous-screen") {
+    const ProjectConfig& project = projectLoader.getProject();
+    int count = (int)project.screens.size();
+    if (count == 0) return;
+    int delta = (action.type == "next-screen") ? 1 : -1;
+    int newIndex = ((currentScreenIndex + delta) % count + count) % count;
+    handleTestScreenSwitch(newIndex);
+  } else if (action.type == "goto-screen") {
+    const ProjectConfig& project = projectLoader.getProject();
+    for (int i = 0; i < (int)project.screens.size(); i++) {
+      if (project.screens[i].id == action.targetScreenId) {
+        handleTestScreenSwitch(i);
+        break;
+      }
+    }
+  } else if (action.type == "send-mqtt") {
+    mqttClient.publish(action.mqttTopic, action.mqttMessage, false);
+  } else if (action.type == "goto-setup-mode") {
+    enterSetupMode();
+  }
+}
+
+// Topmost (highest zIndex) SoftwareButton on the current screen whose rect
+// contains (x, y), or nullptr if none - used by loop()'s touch handling.
+// Top-level objects only: tab-control/panel nesting isn't in the M5 Dial
+// DDF's supportedObjectTypes yet (see docs/device-contract.md §1's own gap
+// note), so there's nothing under a SoftwareButton to recurse past, and
+// nothing above it either - every object on an M5 Dial screen today is a
+// direct child of the screen.
+const ScreenObject* findSoftwareButtonAt(int x, int y) {
+  if (!projectLoader.isLoaded()) return nullptr;
+  const ProjectConfig& project = projectLoader.getProject();
+  if (currentScreenIndex < 0 || currentScreenIndex >= (int)project.screens.size()) return nullptr;
+
+  const ScreenObject* best = nullptr;
+  for (const auto& obj : project.screens[currentScreenIndex].objects) {
+    if (obj.type != "SoftwareButton") continue;
+    if (x < obj.x || x >= obj.x + obj.width || y < obj.y || y >= obj.y + obj.height) continue;
+    if (!best || obj.zIndex >= best->zIndex) best = &obj;
+  }
+  return best;
+}
+
 void setup() {
   auto cfg = M5.config();
   M5Dial.begin(cfg, /*enableEncoder=*/true, /*enableRFID=*/false);
@@ -647,6 +737,7 @@ void setup() {
 
   lastActivityMs = millis();
   lastEncoderPosForIdle = M5Dial.Encoder.read();
+  lastDispatchedEncoderPos = lastEncoderPosForIdle;
 }
 
 void loop() {
@@ -691,14 +782,30 @@ void loop() {
   }
 
   // Auto-sleep tracking - see enterIdleSleep()/wakeFromIdleSleep()'s own
-  // comments. "Activity" is deliberately limited to a button press or an
-  // encoder movement, not a background MQTT-driven redraw - presence of
-  // new data isn't presence of a person. Unlike this feature's first
-  // version, sleeping no longer skips mqttClient.loop()/
+  // comments. "Activity" is deliberately limited to a button press, an
+  // encoder movement, or a touch, not a background MQTT-driven redraw -
+  // presence of new data isn't presence of a person. Unlike this feature's
+  // first version, sleeping no longer skips mqttClient.loop()/
   // testInterfaceServer.handleClient() below at all - WiFi/MQTT/HTTP stay
   // fully live through a "sleep", only the backlight actually changes.
+  auto touchDetail = M5Dial.Touch.getDetail();
+  bool touchDown = touchDetail.wasPressed();
+  bool touchUp = touchDetail.wasReleased();
+
+  // Captured before wakeFromIdleSleep() runs below: true only when this
+  // touch-down is the one waking the device from a dark screen. Stashed in
+  // suppressPressedButtonAction (a persistent flag, not a local - touch-up
+  // arrives on a later loop() iteration) so a blind tap (you can't see
+  // what's under your finger on a screen that was just off) only ever
+  // wakes the display, never also fires whatever SoftwareButton happened
+  // to be there - see this session's own design discussion for why this
+  // deliberately does NOT extend to the front/rear buttons, which have no
+  // "blind aim" ambiguity (one fixed physical location each, not several
+  // overlapping on-screen targets).
+  if (touchDown) suppressPressedButtonAction = deviceSleeping;
+
   long currentEncoderPosForIdle = M5Dial.Encoder.read();
-  bool userActivity = M5Dial.BtnA.wasPressed() || (currentEncoderPosForIdle != lastEncoderPosForIdle);
+  bool userActivity = M5Dial.BtnA.wasPressed() || touchDown || (currentEncoderPosForIdle != lastEncoderPosForIdle);
   lastEncoderPosForIdle = currentEncoderPosForIdle;
 
   if (userActivity) {
@@ -706,6 +813,50 @@ void loop() {
     if (deviceSleeping) wakeFromIdleSleep();
   } else if (!deviceSleeping && millis() - lastActivityMs >= IDLE_SLEEP_MS) {
     enterIdleSleep();
+  }
+
+  // Rotate Left/Right (btn-0/btn-1) dispatch - see ENCODER_CLICK_INCREMENTS'
+  // own comment. A while loop, not if, so a fast spin that crosses several
+  // detents in one loop() iteration still dispatches once per detent
+  // instead of dropping the extras. No idle-wake suppression here (unlike
+  // touch) - rotating always does the same predictable thing regardless of
+  // whether the screen was visible, same reasoning as the front/rear
+  // buttons.
+  long encoderDeltaSinceDispatch = currentEncoderPosForIdle - lastDispatchedEncoderPos;
+  while (encoderDeltaSinceDispatch >= ENCODER_CLICK_INCREMENTS) {
+    dispatchButtonAction(projectLoader.getButtonAction(currentScreenIndex, "btn-1"));
+    lastDispatchedEncoderPos += ENCODER_CLICK_INCREMENTS;
+    encoderDeltaSinceDispatch -= ENCODER_CLICK_INCREMENTS;
+  }
+  while (encoderDeltaSinceDispatch <= -ENCODER_CLICK_INCREMENTS) {
+    dispatchButtonAction(projectLoader.getButtonAction(currentScreenIndex, "btn-0"));
+    lastDispatchedEncoderPos -= ENCODER_CLICK_INCREMENTS;
+    encoderDeltaSinceDispatch += ENCODER_CLICK_INCREMENTS;
+  }
+
+  // Soft-button touch handling - see findSoftwareButtonAt()'s own comment
+  // for the hit-test, ColorScreenRenderer::renderScreen()'s for why a full
+  // redraw (not a partial single-object update) is used for the pathNormal/
+  // pathActive swap. Release only fires the action if still over the same
+  // button it went down on (touchUp's stillHit check) - lets a touch be
+  // cancelled by dragging off before lifting.
+  if (touchDown) {
+    const ScreenObject* hit = findSoftwareButtonAt(touchDetail.x, touchDetail.y);
+    pressedSoftButtonId = hit ? hit->id : "";
+    if (hit && screenRenderer) {
+      screenRenderer->renderScreen(currentScreenIndex, pressedSoftButtonId);
+      blitCanvasToDisplay();
+    }
+  } else if (touchUp && !pressedSoftButtonId.isEmpty()) {
+    const ScreenObject* stillHit = findSoftwareButtonAt(touchDetail.x, touchDetail.y);
+    bool fire = stillHit && stillHit->id == pressedSoftButtonId && !suppressPressedButtonAction;
+    ButtonAction actionToFire = fire ? stillHit->properties.action : ButtonAction();
+    pressedSoftButtonId = "";
+    if (screenRenderer) {
+      screenRenderer->renderScreen(currentScreenIndex);
+      blitCanvasToDisplay();
+    }
+    if (fire) dispatchButtonAction(actionToFire);
   }
 
   mqttClient.loop();
@@ -720,37 +871,30 @@ void loop() {
 
   testInterfaceServer.handleClient();
 
-  // Hold the push button, then rotate the dial left (~3 clicks) then
-  // right (~3 clicks, measured from wherever the left phase ended) to
-  // re-enter setup mode - see this gesture's own header comment (top of
-  // file) for why it replaced a plain 3s hold.
-  if (M5Dial.BtnA.wasPressed()) {
-    setupGestureStartEncoderPos = M5Dial.Encoder.read();
-    setupGestureMinDelta = 0;
-    setupGestureWentLeft = false;
+  // Front button (btn-2 in the DDF's hardwareButtons list) - fires its
+  // configured ButtonAction (screen override, else project-wide default,
+  // else nothing) on release, same trigger point as SoftwareButton touches
+  // above for one consistent rule across every button type.
+  if (M5Dial.BtnA.wasReleased()) {
+    dispatchButtonAction(projectLoader.getButtonAction(currentScreenIndex, "btn-2"));
   }
 
-  if (M5Dial.BtnA.isPressed()) {
-    long delta = M5Dial.Encoder.read() - setupGestureStartEncoderPos;
-    if (delta < setupGestureMinDelta) setupGestureMinDelta = delta;
-
-    if (!setupGestureWentLeft && setupGestureMinDelta <= -SETUP_GESTURE_THRESHOLD) {
-      setupGestureWentLeft = true;
-      Serial.println("[M5Dial] Setup gesture: left phase detected, turn right to confirm");
-    }
-
-    if (setupGestureWentLeft && (delta - setupGestureMinDelta) >= SETUP_GESTURE_THRESHOLD) {
-      Serial.println("[M5Dial] Setup gesture completed, entering AP setup mode");
-      // Must release port 80 before wifiSetupServer.startAP() binds its
-      // own WebServer there - see TestInterfaceServer::stop()'s own
-      // comment for what silently broke without this.
-      testInterfaceServer.stop();
-      setupModeActive = true;
-      wifiSetupServer.startAP();
-    }
-  } else if (M5Dial.BtnA.wasReleased()) {
-    setupGestureMinDelta = 0;
-    setupGestureWentLeft = false;
+  // Rear button (GPIO0, the same pin used for forcing USB download mode) -
+  // M5Dial.h doesn't alias this one (only index 0 is exposed, as BtnA),
+  // but M5Unified already reads and debounces it every M5Dial.update()
+  // call exactly like BtnA (see M5Unified.cpp's board_M5Dial case, bit 1
+  // of btn_rawstate_bits) - M5.getButton(1) is the same Button_Class
+  // mechanism, just not given a friendly name in this board's own header.
+  // Deliberately NOT exposed anywhere in the DDF or designer (see
+  // docs/device-contract.md) - a fixed, project-independent way into setup
+  // mode so a factory-fresh or misconfigured device (no project loaded, or
+  // no button assigned "Go to Setup Mode") is never locked out. Plain
+  // press, no hold required - the rear location already makes it hard to
+  // trigger by accident, and this is a recovery path where a forgettable
+  // hold-timing requirement would cost more than it protects.
+  if (M5.getButton(1).wasReleased()) {
+    Serial.println("[M5Dial] Rear button pressed, entering setup mode");
+    enterSetupMode();
   }
 
   delay(10);

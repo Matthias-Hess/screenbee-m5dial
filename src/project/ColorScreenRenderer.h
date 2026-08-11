@@ -37,14 +37,20 @@ public:
   // (z-index order, matching sortChildrenByZIndex on the designer side).
   // Does NOT blit to the display - caller does that once after this
   // returns, same as the color-canvas spike (checkpoint 2a).
-  bool renderScreen(int screenIndex);
+  // pressedButtonId: if non-empty and it matches a SoftwareButton's own id
+  // on this screen, that one button draws pathActive instead of pathNormal
+  // - see main.cpp's touch handling for why a full re-render (not a
+  // partial single-object update) is used for this: cheap enough on a
+  // color LCD with no e-paper ghosting concern to optimize around, same
+  // reasoning as the existing MQTT-triggered redraw path.
+  bool renderScreen(int screenIndex, const String& pressedButtonId = "");
 
 private:
   IProjectLoader& projectLoader_;
   ClippedCanvas16* canvas_;
   U8G2_FOR_ADAFRUIT_GFX u8g2_;
 
-  bool renderObject(const ScreenObject& obj);
+  bool renderObject(const ScreenObject& obj, const String& pressedButtonId);
   bool renderBox(const ScreenObject& obj);
   bool renderLine(const ScreenObject& obj);
   bool renderLabel(const ScreenObject& obj);
@@ -52,7 +58,7 @@ private:
   bool renderLevelIndicator(const ScreenObject& obj);
   bool renderMQTTIconField(const ScreenObject& obj);
   bool renderIcon(const ScreenObject& obj);
-  bool renderSoftwareButton(const ScreenObject& obj);
+  bool renderSoftwareButton(const ScreenObject& obj, bool isPressed);
 
   bool evaluateCondition(float value, const String& op, float threshold) const;
   String getIconPathForValue(const ScreenObject& obj, const String& valueStr) const;

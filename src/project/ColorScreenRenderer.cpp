@@ -476,14 +476,16 @@ bool ColorScreenRenderer::renderIcon(const ScreenObject& obj) {
   return true;
 }
 
-// Always draws pathNormal - there's no touch tracking yet to know whether
-// this button is currently pressed (that's checkpoint 4's job). The
-// bitmap itself is already fully rendered by the designer's export
-// (drop shadow, border, label text baked in) - this only needs to decode
-// and blit it, not reconstruct any of that.
-bool ColorScreenRenderer::renderSoftwareButton(const ScreenObject& obj) {
-  if (obj.pathNormal.isEmpty()) return false;
-  if (!ColorAssetLoader::drawBMPToCanvas(canvas_, obj.pathNormal, obj.x, obj.y)) {
+// Draws pathActive while pressed (isPressed, driven by main.cpp's touch
+// hit-testing - see ColorScreenRenderer.h's renderScreen() comment), else
+// pathNormal. Both bitmaps are already fully rendered by the designer's
+// export (drop shadow / 3D-press offset, border, label text baked in) -
+// this only needs to decode and blit whichever one applies, not
+// reconstruct any of that.
+bool ColorScreenRenderer::renderSoftwareButton(const ScreenObject& obj, bool isPressed) {
+  const String& path = isPressed ? obj.pathActive : obj.pathNormal;
+  if (path.isEmpty()) return false;
+  if (!ColorAssetLoader::drawBMPToCanvas(canvas_, path, obj.x, obj.y)) {
     canvas_->fillRect(obj.x + 2, obj.y + 2, obj.width - 4, obj.height - 4, 0x0000);
     canvas_->drawRect(obj.x, obj.y, obj.width, obj.height, 0x0000);
     return false;
@@ -491,7 +493,7 @@ bool ColorScreenRenderer::renderSoftwareButton(const ScreenObject& obj) {
   return true;
 }
 
-bool ColorScreenRenderer::renderObject(const ScreenObject& obj) {
+bool ColorScreenRenderer::renderObject(const ScreenObject& obj, const String& pressedButtonId) {
   if (obj.type == "box") return renderBox(obj);
   if (obj.type == "line") return renderLine(obj);
   if (obj.type == "label") return renderLabel(obj);
@@ -499,14 +501,14 @@ bool ColorScreenRenderer::renderObject(const ScreenObject& obj) {
   if (obj.type == "level-indicator") return renderLevelIndicator(obj);
   if (obj.type == "MQTTIconField") return renderMQTTIconField(obj);
   if (obj.type == "icon") return renderIcon(obj);
-  if (obj.type == "SoftwareButton") return renderSoftwareButton(obj);
+  if (obj.type == "SoftwareButton") return renderSoftwareButton(obj, !pressedButtonId.isEmpty() && obj.id == pressedButtonId);
 
   Serial.printf("[ColorScreenRenderer] Object type \"%s\" not implemented yet, skipping (id=%s)\n",
                 obj.type.c_str(), obj.id.c_str());
   return false;
 }
 
-bool ColorScreenRenderer::renderScreen(int screenIndex) {
+bool ColorScreenRenderer::renderScreen(int screenIndex, const String& pressedButtonId) {
   if (!projectLoader_.isLoaded()) return false;
 
   const ProjectConfig& project = projectLoader_.getProject();
@@ -523,7 +525,7 @@ bool ColorScreenRenderer::renderScreen(int screenIndex) {
             [](const ScreenObject& a, const ScreenObject& b) { return a.zIndex < b.zIndex; });
 
   for (const auto& obj : sortedObjects) {
-    renderObject(obj);
+    renderObject(obj, pressedButtonId);
   }
 
   return true;

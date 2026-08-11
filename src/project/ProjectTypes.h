@@ -30,6 +30,28 @@ struct Point {
   int y;
 };
 
+// A single button action - mirrors the designer's HardwareButtonAction
+// (components/project-editor.tsx) field-for-field. `type` is one of
+// "next-screen" / "previous-screen" / "goto-screen" / "send-mqtt" /
+// "goto-setup-mode", or empty to mean "nothing configured" (the default-
+// constructed value - callers treat an empty type as a no-op). Shared
+// between the physical push button (HardwareButtonDef::defaultAction,
+// Screen::buttonActions) and a SoftwareButton object's own
+// ObjectProperties::action below - both dispatch through main.cpp's
+// dispatchButtonAction(), one shared function rather than two parallel
+// ones. "goto-setup-mode" takes no extra fields (like next-screen/
+// previous-screen) - it's the only supported way into setup mode from a
+// project-configured button; the rear GPIO0 button is a separate,
+// hardcoded, project-independent fallback that bypasses this entirely
+// (deliberately not exposed here or in the DDF - see main.cpp's own
+// comment on it).
+struct ButtonAction {
+  String type;
+  String targetScreenId;   // for "goto-screen"
+  String mqttTopic;        // for "send-mqtt"
+  String mqttMessage;      // for "send-mqtt"
+};
+
 // Base properties for screen objects
 struct ObjectProperties {
   // Common properties
@@ -106,6 +128,13 @@ struct ObjectProperties {
   String comparisonOperator;
   String comparisonValue;
 
+  // SoftwareButton properties - the button's own configured action (empty
+  // type = configured with no action, still renders/presses visually but
+  // dispatchButtonAction() is a no-op for it). Parsed from properties.action
+  // by ProjectLoader::parseObjectProperties() via the same parseButtonAction()
+  // hardware buttons already use - see ButtonAction's own comment above.
+  ButtonAction action;
+
   ObjectProperties()
     : numberOfDecimals(2), fontSize(12), strokeWidth(1), cornerRadius(0), filletRadius(0),
       arrowStart(false), arrowEnd(false) {}
@@ -139,19 +168,6 @@ struct ScreenObject {
   // a complete element type at instantiation, not at struct-definition
   // time), no forward-declaration trick required.
   std::vector<ScreenObject> children;
-};
-
-// A single hardware-button action - mirrors the designer's
-// HardwareButtonAction (components/screenman-editor.tsx) field-for-field.
-// `type` is one of "next-screen" / "previous-screen" / "goto-screen" /
-// "send-mqtt", or empty to mean "nothing configured" (the default-
-// constructed value - callers treat an empty type as "fall through to the
-// generic button-press MQTT notification every button has always sent").
-struct ButtonAction {
-  String type;
-  String targetScreenId;   // for "goto-screen"
-  String mqttTopic;        // for "send-mqtt"
-  String mqttMessage;      // for "send-mqtt"
 };
 
 // One screen's override for a single button id (e.g. "btn-0") - see

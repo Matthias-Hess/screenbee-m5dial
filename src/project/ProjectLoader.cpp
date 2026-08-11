@@ -323,6 +323,15 @@ ObjectProperties ProjectLoader::parseObjectProperties(JsonObject propsJson) {
   props.comparisonOperator = propsJson["comparisonOperator"] | "==";
   props.comparisonValue = propsJson["comparisonValue"] | "";
 
+  // SoftwareButton action - same ButtonAction shape/parser as hardware
+  // buttons (see ProjectTypes.h's ButtonAction comment). Absent for every
+  // other object type's properties (additive JSON field), and for a
+  // SoftwareButton with no action configured - both leave props.action at
+  // its default-constructed, empty-type value.
+  if (propsJson["action"].is<JsonObject>()) {
+    props.action = parseButtonAction(propsJson["action"].as<JsonObject>());
+  }
+
   return props;
 }
 
