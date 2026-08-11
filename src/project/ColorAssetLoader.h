@@ -34,4 +34,11 @@ bool drawBMPToCanvas(ClippedCanvas16* canvas, const String& path, int16_t x, int
 // already drawn.
 bool drawGrayscaleMaskToCanvas(ClippedCanvas16* canvas, const String& path, int16_t x, int16_t y, uint16_t fgColor, uint16_t bgColor);
 
+// Drops drawGrayscaleMaskToCanvas()'s in-RAM icon-bytes cache. Icon paths
+// are screen-id-based, not content-hashed (see lib/asset-export.ts's
+// exportPageIcon()), so the same path can point at different bytes after a
+// redeploy - call this whenever a project is (re)loaded so a changed icon
+// doesn't keep showing its old cached pixels.
+void clearGrayscaleMaskCache();
+
 }

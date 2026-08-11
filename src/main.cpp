@@ -23,6 +23,7 @@
 #include "ClippedCanvas16.h"
 #include "project/ProjectLoader.h"
 #include "project/ColorScreenRenderer.h"
+#include "project/ColorAssetLoader.h"
 #include "test_project.h"
 #include "test_icon_bmp.h"
 #include "DeviceInfo.h"
@@ -99,12 +100,38 @@ long lastEncoderPosForIdle = 0;
 const long ENCODER_CLICK_INCREMENTS = 4;
 long lastDispatchedEncoderPos = 0;
 
+// Continuous encoder-to-navigator coupling (2026-08-11) - only used while
+// btn-0/btn-1 are configured as previous-screen/next-screen (see loop()'s
+// continuousNavActive check); ENCODER_CLICK_INCREMENTS-based discrete
+// dispatch above still handles every other button-action assignment on
+// those two buttons unchanged. referenceEncoderPos/referenceScreenIndex is
+// the "zero point" the continuous scroll position is computed from -
+// recalibrateEncoderReference() re-zeroes it to (current raw encoder
+// position, current screen) every time the screen changes some way OTHER
+// than this continuous coupling itself (touch, front button, goto-screen,
+// project reload), so the next turn of the dial always starts from
+// wherever the dial and the screen actually agree "now" is - never a stale
+// point left over from before an unrelated jump.
+long referenceEncoderPos = 0;
+int referenceScreenIndex = 0;
+
 // Which screen is currently on the display - changed by dispatchButtonAction()
 // (next-screen/previous-screen/goto-screen) since 2026-08-10, previously
 // only ever 0 (no navigation wired up yet). onMqttMessage() needs to know
 // it to decide whether an incoming value affects what's visible right now,
 // matching Application::currentScreenIndex_ in the e-paper firmware.
 int currentScreenIndex = 0;
+
+// Re-zeroes the continuous-encoder reference point (see its own comment
+// above) to "right now" - call this immediately after every currentScreenIndex
+// change that ISN'T the continuous coupling itself, so the next dial turn
+// always starts from wherever the dial and the screen actually agree "now"
+// is.
+void recalibrateEncoderReference() {
+  referenceEncoderPos = RotaryEncoderReader::read();
+  referenceScreenIndex = currentScreenIndex;
+}
+
 // Mirrors Application::topicsSubscribed_ - subscribeToAllTopics() is a
 // no-op once this is true, so a project reload can force a clean
 // resubscribe by clearing it first (not done anywhere yet - only one
@@ -296,6 +323,12 @@ void loadAndRenderProject() {
                 projectLoader.getProject().name.c_str(), projectLoader.getProject().screens.size(), projectPath.c_str());
 
   currentScreenIndex = 0;
+  recalibrateEncoderReference();
+  // Icon paths are screen-id-based, not content-hashed - a redeploy can
+  // change what a path's bytes actually are, so the cache must not survive
+  // across a reload. See ColorAssetLoader::clearGrayscaleMaskCache()'s own
+  // comment.
+  ColorAssetLoader::clearGrayscaleMaskCache();
   mqttClient.clearSubscriptions();
   topicsSubscribed = false;
   subscribeToAllTopics();
@@ -321,6 +354,7 @@ bool handleTestScreenSwitch(int index) {
   if (!screenRenderer) return false;
 
   currentScreenIndex = index;
+  recalibrateEncoderReference();
   if (!screenRenderer->renderScreen(index)) return false;
   blitCanvasToDisplay();
   return true;
@@ -683,6 +717,7 @@ void dispatchButtonAction(const ButtonAction& action) {
     // in one pass, matching how the touch-press pathActive redraw already
     // avoids the same double-blit for a different case.
     currentScreenIndex = newIndex;
+    recalibrateEncoderReference();
     // Only next-screen/previous-screen trigger the animated navigator -
     // goto-screen and every other action type are direct jumps, no
     // orientation aid needed. See ScreenNavigatorOverlay's own header
@@ -841,41 +876,101 @@ void loop() {
     enterIdleSleep();
   }
 
-  // Shows the navigator on the very first raw increment, not just once a
-  // full detent completes - marks the CURRENT screen's tablet (no switch
-  // yet), so you see you're "in" the navigator and where you are before
-  // the actual jump happens at the next full click. Also doubles as the
-  // overlay's hold-timer reset: trigger() restarts the same countdown
-  // ScreenNavigatorOverlay uses to fly the tablets back out, so "tablets
-  // disappear after 1.5s with no further increment" falls out of this
-  // same call without a second, separate timer - found live 2026-08-11
-  // this was nicer than waiting for a full click before showing anything.
-  // If this same movement also completes a full detent below,
-  // dispatchButtonAction()'s own trigger() call (with the new index) runs
-  // right after and simply overwrites which tablet ends up marked - no
-  // visible inconsistency, only the final state after both calls in this
-  // iteration ever gets rendered.
-  if (encoderMoved) {
-    screenNavigatorOverlay.trigger(currentScreenIndex);
-  }
+  // Continuous coupling only kicks in when btn-0/btn-1 are configured
+  // exactly as previous-screen/next-screen - the DDF/designer lets either
+  // be assigned any ButtonAction (send-mqtt, goto-screen, ...), and the
+  // "scroll position tracks the dial in real time" feel below only makes
+  // sense for plain screen navigation. Anything else on those two buttons
+  // keeps the original discrete, once-per-detent dispatch further down.
+  // Re-checked every iteration (cheap - two small getButtonAction lookups)
+  // since the active screen's own override can change which action is
+  // configured without a reboot.
+  bool continuousNavActive = projectLoader.isLoaded() &&
+      projectLoader.getButtonAction(currentScreenIndex, "btn-0").type == "previous-screen" &&
+      projectLoader.getButtonAction(currentScreenIndex, "btn-1").type == "next-screen";
 
-  // Rotate Left/Right (btn-0/btn-1) dispatch - see ENCODER_CLICK_INCREMENTS'
-  // own comment. A while loop, not if, so a fast spin that crosses several
-  // detents in one loop() iteration still dispatches once per detent
-  // instead of dropping the extras. No idle-wake suppression here (unlike
-  // touch) - rotating always does the same predictable thing regardless of
-  // whether the screen was visible, same reasoning as the front/rear
-  // buttons.
-  long encoderDeltaSinceDispatch = currentEncoderPosForIdle - lastDispatchedEncoderPos;
-  while (encoderDeltaSinceDispatch >= ENCODER_CLICK_INCREMENTS) {
-    dispatchButtonAction(projectLoader.getButtonAction(currentScreenIndex, "btn-1"));
-    lastDispatchedEncoderPos += ENCODER_CLICK_INCREMENTS;
-    encoderDeltaSinceDispatch -= ENCODER_CLICK_INCREMENTS;
-  }
-  while (encoderDeltaSinceDispatch <= -ENCODER_CLICK_INCREMENTS) {
-    dispatchButtonAction(projectLoader.getButtonAction(currentScreenIndex, "btn-0"));
-    lastDispatchedEncoderPos -= ENCODER_CLICK_INCREMENTS;
-    encoderDeltaSinceDispatch += ENCODER_CLICK_INCREMENTS;
+  if (continuousNavActive) {
+    // scrollPosition is a real-valued screen index computed straight from
+    // the raw encoder position relative to referenceEncoderPos/
+    // referenceScreenIndex (re-zeroed by recalibrateEncoderReference()
+    // whenever the screen changes some other way - see that function's own
+    // comment) - so the tablet strip visibly slides with the dial instead
+    // of jumping once per detent. The screen itself switches the moment
+    // rounding crosses to a different whole index - roughly half a click,
+    // found live 2026-08-11 to feel more directly responsive than waiting
+    // for a full detent.
+    const ProjectConfig& project = projectLoader.getProject();
+    int count = (int)project.screens.size();
+    if (encoderMoved && count > 0) {
+      // Minus, not plus - turning the dial right visually rotates the
+      // tablet strip right (the tablet that was to the left slides into
+      // the center), the opposite of "right = toward higher indices" -
+      // found live 2026-08-11 to be the expected direction for this
+      // feature specifically (unrelated to next-screen/previous-screen's
+      // own direction elsewhere, which this bypasses entirely).
+      float rawScrollPosition = (float)referenceScreenIndex -
+          (float)(currentEncoderPosForIdle - referenceEncoderPos) / (float)ENCODER_CLICK_INCREMENTS;
+      // Clamped, not wrapped (2026-08-11, replacing an earlier wrap-around
+      // version) - the strip ends at the first/last screen instead of
+      // cycling back. Clamping rawScrollPosition itself, not just the
+      // derived index, matters: otherwise continuing to turn past the end
+      // keeps accumulating a large fractional offset that then has to be
+      // "wound back" before the index starts changing again when reversing
+      // - clamping keeps scrollPosition always in sync with what's
+      // actually reachable.
+      float scrollPosition = constrain(rawScrollPosition, 0.0f, (float)(count - 1));
+      int newIndex = constrain((int)roundf(scrollPosition), 0, count - 1);
+      screenNavigatorOverlay.triggerContinuous(scrollPosition);
+      // Deliberately does NOT call recalibrateEncoderReference() here -
+      // doing so would re-zero the reference to the CURRENT raw position on
+      // every single tick, which collapses the fractional part back to
+      // exactly newIndex every time and defeats the whole point of tracking
+      // a continuous in-between position. The reference only moves when
+      // something other than this coupling changes the screen.
+      currentScreenIndex = newIndex;
+    }
+    // Keeps the discrete dispatch's own bookkeeping from accumulating a
+    // large backlog while continuous mode is active, so if the active
+    // screen's override switches back to a non-navigation action mid-turn,
+    // the discrete path below doesn't replay a burst of stale detents.
+    lastDispatchedEncoderPos = currentEncoderPosForIdle;
+  } else {
+    // Shows the navigator on the very first raw increment, not just once a
+    // full detent completes - marks the CURRENT screen's tablet (no switch
+    // yet), so you see you're "in" the navigator and where you are before
+    // the actual jump happens at the next full click. Also doubles as the
+    // overlay's hold-timer reset: trigger() restarts the same countdown
+    // ScreenNavigatorOverlay uses to fly the tablets back out, so "tablets
+    // disappear after 1.5s with no further increment" falls out of this
+    // same call without a second, separate timer - found live 2026-08-11
+    // this was nicer than waiting for a full click before showing anything.
+    // If this same movement also completes a full detent below,
+    // dispatchButtonAction()'s own trigger() call (with the new index) runs
+    // right after and simply overwrites which tablet ends up marked - no
+    // visible inconsistency, only the final state after both calls in this
+    // iteration ever gets rendered.
+    if (encoderMoved) {
+      screenNavigatorOverlay.trigger(currentScreenIndex);
+    }
+
+    // Rotate Left/Right (btn-0/btn-1) dispatch - see ENCODER_CLICK_INCREMENTS'
+    // own comment. A while loop, not if, so a fast spin that crosses several
+    // detents in one loop() iteration still dispatches once per detent
+    // instead of dropping the extras. No idle-wake suppression here (unlike
+    // touch) - rotating always does the same predictable thing regardless of
+    // whether the screen was visible, same reasoning as the front/rear
+    // buttons.
+    long encoderDeltaSinceDispatch = currentEncoderPosForIdle - lastDispatchedEncoderPos;
+    while (encoderDeltaSinceDispatch >= ENCODER_CLICK_INCREMENTS) {
+      dispatchButtonAction(projectLoader.getButtonAction(currentScreenIndex, "btn-1"));
+      lastDispatchedEncoderPos += ENCODER_CLICK_INCREMENTS;
+      encoderDeltaSinceDispatch -= ENCODER_CLICK_INCREMENTS;
+    }
+    while (encoderDeltaSinceDispatch <= -ENCODER_CLICK_INCREMENTS) {
+      dispatchButtonAction(projectLoader.getButtonAction(currentScreenIndex, "btn-0"));
+      lastDispatchedEncoderPos -= ENCODER_CLICK_INCREMENTS;
+      encoderDeltaSinceDispatch += ENCODER_CLICK_INCREMENTS;
+    }
   }
 
   // Soft-button touch handling - see findSoftwareButtonAt()'s own comment
