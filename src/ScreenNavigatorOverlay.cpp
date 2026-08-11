@@ -62,14 +62,29 @@ ScreenNavigatorOverlay::ScreenNavigatorOverlay(ClippedCanvas16* canvas, IProject
 void ScreenNavigatorOverlay::beginOrExtend() {
   if (phase_ == Phase::Idle) {
     phase_ = Phase::Entering;
+    phaseStartMs_ = millis();
+  } else if (phase_ == Phase::Entering) {
+    // Already mid fly-in - leave it alone and let the radius ramp finish
+    // on its own schedule (update() flips Entering->Holding once ENTER_MS
+    // has actually elapsed). Retriggering here on every single raw encoder
+    // tick used to unconditionally jump straight to Holding, snapping the
+    // radius to its resting value after only a few milliseconds - the
+    // fly-in never got a chance to actually play while continuously
+    // turning. That was invisible back when only the phase (not the
+    // tablets' angular position too) changed per trigger, but very obvious
+    // once continuous scrolling made the strip's position move in real
+    // time alongside it - found live 2026-08-11 ("fly-in animation is
+    // gone"). The caller already updated scrollPosition_ before calling
+    // this, so the angular position keeps tracking the encoder in real
+    // time regardless - only the radius ramp is left undisturbed here.
   } else {
-    // Already visible, mid fly-in, or mid fly-out - just restart the hold
-    // timer. Replaying the fly-in on every single detent while spinning the
-    // dial quickly would look like a stutter, not an animation - see this
-    // class's own header comment.
+    // Holding or Exiting - already fully visible at some point, or on its
+    // way out. Jump/resume to Holding and restart the hold-timer countdown
+    // - replaying the fly-in here would look like a stutter, not an
+    // animation - see this class's own header comment.
     phase_ = Phase::Holding;
+    phaseStartMs_ = millis();
   }
-  phaseStartMs_ = millis();
 }
 
 void ScreenNavigatorOverlay::trigger(int newScreenIndex) {
