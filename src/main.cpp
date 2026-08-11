@@ -912,21 +912,32 @@ void loop() {
           (float)(currentEncoderPosForIdle - referenceEncoderPos) / (float)ENCODER_CLICK_INCREMENTS;
       // Clamped, not wrapped (2026-08-11, replacing an earlier wrap-around
       // version) - the strip ends at the first/last screen instead of
-      // cycling back. Clamping rawScrollPosition itself, not just the
-      // derived index, matters: otherwise continuing to turn past the end
-      // keeps accumulating a large fractional offset that then has to be
-      // "wound back" before the index starts changing again when reversing
-      // - clamping keeps scrollPosition always in sync with what's
-      // actually reachable.
+      // cycling back.
       float scrollPosition = constrain(rawScrollPosition, 0.0f, (float)(count - 1));
-      int newIndex = constrain((int)roundf(scrollPosition), 0, count - 1);
+      int newIndex = (int)roundf(scrollPosition);
       screenNavigatorOverlay.triggerContinuous(scrollPosition);
-      // Deliberately does NOT call recalibrateEncoderReference() here -
-      // doing so would re-zero the reference to the CURRENT raw position on
-      // every single tick, which collapses the fractional part back to
-      // exactly newIndex every time and defeats the whole point of tracking
-      // a continuous in-between position. The reference only moves when
-      // something other than this coupling changes the screen.
+      // Deliberately does NOT call recalibrateEncoderReference() here on
+      // every tick - doing so would re-zero the reference to the CURRENT
+      // raw position every frame, which collapses the fractional part back
+      // to exactly newIndex every time and defeats the whole point of
+      // tracking a continuous in-between position.
+      //
+      // BUT: right when clamping actually kicks in (rawScrollPosition !=
+      // scrollPosition, i.e. the dial has been turned past an end), the
+      // reference DOES need re-zeroing to the clamped position, right now -
+      // found live 2026-08-11 as a real bug otherwise: without this,
+      // continuing to turn past the end keeps accumulating an invisible
+      // backlog in rawScrollPosition alone (scrollPosition itself was
+      // already clamped, but referenceEncoderPos/referenceScreenIndex never
+      // moved), so reversing direction required winding back through that
+      // same backlog - the same number of clicks it took to overshoot -
+      // before the strip visibly started moving again. Re-zeroing every
+      // frame the dial is still pinned against an end keeps that backlog
+      // from ever building up, so reversing responds immediately.
+      if (scrollPosition != rawScrollPosition) {
+        referenceEncoderPos = currentEncoderPosForIdle;
+        referenceScreenIndex = newIndex;
+      }
       currentScreenIndex = newIndex;
     }
     // Keeps the discrete dispatch's own bookkeeping from accumulating a
