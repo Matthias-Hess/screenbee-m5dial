@@ -18,4 +18,20 @@ namespace ColorAssetLoader {
 
 bool drawBMPToCanvas(ClippedCanvas16* canvas, const String& path, int16_t x, int16_t y);
 
+// Decodes an 8-bit PGM (P5, binary/raw) grayscale mask and draws it
+// blended per-pixel between `bgColor` (white=255 in the source, fully
+// background) and `fgColor` (black=0, the icon's full foreground color) -
+// see lib/asset-converter.ts's convertToGrayscale()/bitmapToPGM() for the
+// exact source format this decodes. Originally a hard 1-bit PBM stencil
+// (draw fgColor or draw nothing) - replaced 2026-08-11 because a hard
+// per-pixel on/off choice threw away the antialiasing the designer's own
+// SVG rasterization already produced, which looked visibly blocky at the
+// small sizes the M5 Dial's screen-switch navigator tablets actually use
+// (see ScreenNavigatorOverlay). Blends against a caller-supplied bgColor
+// rather than reading the canvas back, because the caller (drawTablets())
+// already knows exactly which color it just filled the tablet with -
+// cheaper and simpler than a real read-modify-blend over whatever's
+// already drawn.
+bool drawGrayscaleMaskToCanvas(ClippedCanvas16* canvas, const String& path, int16_t x, int16_t y, uint16_t fgColor, uint16_t bgColor);
+
 }

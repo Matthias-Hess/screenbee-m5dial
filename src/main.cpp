@@ -32,6 +32,7 @@
 #include "MqttClient.h"
 #include "TestInterfaceServer.h"
 #include "DeployManager.h"
+#include "ScreenNavigatorOverlay.h"
 #ifdef JTAG_DEBUG_TEST
 #include "project/ProjectInstaller.h"
 #include "test_deflate_zip.h"
@@ -50,6 +51,7 @@ WiFiSetupServer wifiSetupServer(displayAdapter, configManager);
 MqttClient mqttClient;
 TestInterfaceServer testInterfaceServer(&canvas);
 DeployManager deployManager;
+ScreenNavigatorOverlay screenNavigatorOverlay(&canvas, projectLoader);
 
 bool setupModeActive = false;
 
@@ -668,7 +670,23 @@ void dispatchButtonAction(const ButtonAction& action) {
     if (count == 0) return;
     int delta = (action.type == "next-screen") ? 1 : -1;
     int newIndex = ((currentScreenIndex + delta) % count + count) % count;
-    handleTestScreenSwitch(newIndex);
+    // Deliberately does NOT call handleTestScreenSwitch (which renders AND
+    // blits the destination screen without the overlay) - that produced a
+    // visible one-frame flash of the bare screen before
+    // screenNavigatorOverlay.update() (called later this same loop()
+    // iteration) redrew it WITH tablets and blitted again, found live
+    // 2026-08-11 as the actual cause of "flickers when jumping between
+    // tablets" - on every jump, not just the first. currentScreenIndex is
+    // updated directly here; the overlay's update() is the only render+
+    // blit for this frame, screen content and tablets composited together
+    // in one pass, matching how the touch-press pathActive redraw already
+    // avoids the same double-blit for a different case.
+    currentScreenIndex = newIndex;
+    // Only next-screen/previous-screen trigger the animated navigator -
+    // goto-screen and every other action type are direct jumps, no
+    // orientation aid needed. See ScreenNavigatorOverlay's own header
+    // comment.
+    screenNavigatorOverlay.trigger(newIndex);
   } else if (action.type == "goto-screen") {
     const ProjectConfig& project = projectLoader.getProject();
     for (int i = 0; i < (int)project.screens.size(); i++) {
@@ -895,6 +913,14 @@ void loop() {
   if (M5.getButton(1).wasReleased()) {
     Serial.println("[M5Dial] Rear button pressed, entering setup mode");
     enterSetupMode();
+  }
+
+  // Runs every iteration, not just right after trigger() - a no-op
+  // (returns false immediately) whenever the overlay isn't animating/
+  // holding. Placed last so it reflects a next-screen/previous-screen
+  // dispatched earlier in this very same loop() call.
+  if (screenNavigatorOverlay.update(screenRenderer, currentScreenIndex)) {
+    blitCanvasToDisplay();
   }
 
   delay(10);

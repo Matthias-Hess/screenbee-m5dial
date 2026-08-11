@@ -199,6 +199,7 @@ void ProjectLoader::parseScreens(JsonArray screensArray) {
     screen.name = screenJson["name"] | "";
     screen.path = resolveAssetPath(screenJson["path"] | "");
     screen.backgroundColor = screenJson["backgroundColor"] | "#ffffff";
+    screen.pageIconPath = resolveAssetPath(screenJson["pageIconPath"] | "");
 
     if (screenJson["objects"].is<JsonArray>()) {
       JsonArray objectsArray = screenJson["objects"];

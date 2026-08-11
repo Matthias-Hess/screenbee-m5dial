@@ -20,7 +20,7 @@
 // DDF straight from a live device, matching the e-paper firmware's own
 // "announced device" support. Bump this whenever the DDF changes so a
 // stale cached copy gets refetched.
-#define DDF_VERSION "1.1"
+#define DDF_VERSION "1.3"
 
 // The MQTT topic namespace every device/browser participant in the deploy
 // flow shares (screenbee/<clientId>/...) - same shared protocol as every

@@ -66,4 +66,69 @@ bool drawBMPToCanvas(ClippedCanvas16* canvas, const String& path, int16_t x, int
   return true;
 }
 
+bool drawGrayscaleMaskToCanvas(ClippedCanvas16* canvas, const String& path, int16_t x, int16_t y, uint16_t fgColor, uint16_t bgColor) {
+  if (path.isEmpty()) return false;
+
+  File pgmFile = LittleFS.open(path, "r");
+  if (!pgmFile) {
+    Serial.printf("[ColorAssetLoader] Could not open \"%s\"\n", path.c_str());
+    return false;
+  }
+
+  String magic = pgmFile.readStringUntil('\n');
+  magic.trim();
+  if (magic != "P5") {
+    Serial.printf("[ColorAssetLoader] \"%s\" is not a P5 PGM (bad magic \"%s\")\n", path.c_str(), magic.c_str());
+    pgmFile.close();
+    return false;
+  }
+
+  // Skip comment lines ("#...") between the magic and the dimensions line -
+  // same allowance the e-paper firmware's own PBM parser makes, even though
+  // nothing in this pipeline actually emits comments today.
+  String line;
+  do {
+    line = pgmFile.readStringUntil('\n');
+    line.trim();
+  } while (line.startsWith("#"));
+
+  int spacePos = line.indexOf(' ');
+  int32_t width = line.substring(0, spacePos).toInt();
+  int32_t height = line.substring(spacePos + 1).toInt();
+
+  // Maxval line - always "255" from bitmapToPGM(), the only producer of
+  // this format today. Read and discard rather than hardcode-skip a fixed
+  // byte count, so a stray comment line here (unlikely, but PGM technically
+  // allows one) doesn't desync the parser.
+  pgmFile.readStringUntil('\n');
+
+  // Unpacked once, outside the pixel loop - RGB565: bits [15:11]=R5,
+  // [10:5]=G6, [4:0]=B5.
+  uint16_t fgR = (fgColor >> 11) & 0x1F, fgG = (fgColor >> 5) & 0x3F, fgB = fgColor & 0x1F;
+  uint16_t bgR = (bgColor >> 11) & 0x1F, bgG = (bgColor >> 5) & 0x3F, bgB = bgColor & 0x1F;
+
+  uint8_t* rowBuffer = (uint8_t*)malloc(width);
+  if (!rowBuffer) {
+    Serial.println("[ColorAssetLoader] rowBuffer malloc failed");
+    pgmFile.close();
+    return false;
+  }
+
+  for (int32_t row = 0; row < height; row++) {
+    pgmFile.readBytes((char*)rowBuffer, width);
+    for (int32_t col = 0; col < width; col++) {
+      uint8_t gray = rowBuffer[col];  // 0 = full fgColor, 255 = full bgColor (see convertToGrayscale())
+      if (gray == 255) continue;      // fully background - skip, the tablet fill already drawn there is correct as-is
+      uint16_t r = (fgR * (255 - gray) + bgR * gray) / 255;
+      uint16_t g = (fgG * (255 - gray) + bgG * gray) / 255;
+      uint16_t b = (fgB * (255 - gray) + bgB * gray) / 255;
+      canvas->drawPixel(x + col, y + row, (r << 11) | (g << 5) | b);
+    }
+  }
+
+  free(rowBuffer);
+  pgmFile.close();
+  return true;
+}
+
 }  // namespace ColorAssetLoader

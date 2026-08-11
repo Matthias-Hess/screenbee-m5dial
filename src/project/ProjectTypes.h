@@ -203,6 +203,14 @@ struct Screen {
   // JSON field), in which case every button on this screen just falls back
   // to the project-wide default, same as if this were empty.
   std::vector<ScreenButtonAction> buttonActions;
+  // Present only when the designer's device.json declared
+  // needsPageIconsInSize AND this screen has an icon assigned - a plain
+  // square 8-bit grayscale PGM mask (see
+  // ColorAssetLoader::drawGrayscaleMaskToCanvas), for ScreenNavigatorOverlay's
+  // screen-switch navigator. Empty for every screen otherwise (most
+  // projects, and any project built before this field existed) - callers
+  // must treat empty as "no icon", not an error.
+  String pageIconPath;
 };
 
 // One field pulled out of a "json"-type topic's payload - mirrors the
