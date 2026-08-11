@@ -33,6 +33,7 @@
 #include "TestInterfaceServer.h"
 #include "DeployManager.h"
 #include "ScreenNavigatorOverlay.h"
+#include "RotaryEncoderReader.h"
 #ifdef JTAG_DEBUG_TEST
 #include "project/ProjectInstaller.h"
 #include "test_deflate_zip.h"
@@ -89,8 +90,8 @@ long lastEncoderPosForIdle = 0;
 // identically in the designer's Hardware Buttons settings), but nothing
 // ever dispatched an action for them - only btn-2 (a real physical switch)
 // got wired to dispatchButtonAction() when this session built that
-// function. M5Dial.Encoder.read() returns raw quadrature increments, not
-// "clicks" - reusing the same ~4-increments-per-detent estimate the old
+// function. RotaryEncoderReader::read() returns raw quadrature increments,
+// not "clicks" - reusing the same ~4-increments-per-detent estimate the old
 // (now-removed) setup gesture used. Which physical direction is positive
 // vs negative hasn't been hardware-verified - btn-1 is assigned to
 // positive delta (guessed as "clockwise = right") here; swap the two
@@ -725,7 +726,13 @@ const ScreenObject* findSoftwareButtonAt(int x, int y) {
 
 void setup() {
   auto cfg = M5.config();
-  M5Dial.begin(cfg, /*enableEncoder=*/true, /*enableRFID=*/false);
+  // enableEncoder=false - M5Dial's own ENCODER class silently degrades to
+  // poll-only on this board (GPIO 40/41 aren't in its interrupt pin
+  // table), which was found live to drop/miscount fast physical clicks.
+  // RotaryEncoderReader::begin() below sets up a real interrupt-driven
+  // decoder on the same pins instead - see its own header comment.
+  M5Dial.begin(cfg, /*enableEncoder=*/false, /*enableRFID=*/false);
+  RotaryEncoderReader::begin();
   M5Dial.Display.setBrightness(150);
 
   Serial.begin(115200);
@@ -754,7 +761,7 @@ void setup() {
   Serial.println("[M5Dial] setupWiFi() returned, setup() complete");
 
   lastActivityMs = millis();
-  lastEncoderPosForIdle = M5Dial.Encoder.read();
+  lastEncoderPosForIdle = RotaryEncoderReader::read();
   lastDispatchedEncoderPos = lastEncoderPosForIdle;
 }
 
@@ -822,8 +829,9 @@ void loop() {
   // overlapping on-screen targets).
   if (touchDown) suppressPressedButtonAction = deviceSleeping;
 
-  long currentEncoderPosForIdle = M5Dial.Encoder.read();
-  bool userActivity = M5Dial.BtnA.wasPressed() || touchDown || (currentEncoderPosForIdle != lastEncoderPosForIdle);
+  long currentEncoderPosForIdle = RotaryEncoderReader::read();
+  bool encoderMoved = (currentEncoderPosForIdle != lastEncoderPosForIdle);
+  bool userActivity = M5Dial.BtnA.wasPressed() || touchDown || encoderMoved;
   lastEncoderPosForIdle = currentEncoderPosForIdle;
 
   if (userActivity) {
@@ -831,6 +839,24 @@ void loop() {
     if (deviceSleeping) wakeFromIdleSleep();
   } else if (!deviceSleeping && millis() - lastActivityMs >= IDLE_SLEEP_MS) {
     enterIdleSleep();
+  }
+
+  // Shows the navigator on the very first raw increment, not just once a
+  // full detent completes - marks the CURRENT screen's tablet (no switch
+  // yet), so you see you're "in" the navigator and where you are before
+  // the actual jump happens at the next full click. Also doubles as the
+  // overlay's hold-timer reset: trigger() restarts the same countdown
+  // ScreenNavigatorOverlay uses to fly the tablets back out, so "tablets
+  // disappear after 1.5s with no further increment" falls out of this
+  // same call without a second, separate timer - found live 2026-08-11
+  // this was nicer than waiting for a full click before showing anything.
+  // If this same movement also completes a full detent below,
+  // dispatchButtonAction()'s own trigger() call (with the new index) runs
+  // right after and simply overwrites which tablet ends up marked - no
+  // visible inconsistency, only the final state after both calls in this
+  // iteration ever gets rendered.
+  if (encoderMoved) {
+    screenNavigatorOverlay.trigger(currentScreenIndex);
   }
 
   // Rotate Left/Right (btn-0/btn-1) dispatch - see ENCODER_CLICK_INCREMENTS'

@@ -3,7 +3,12 @@
 
 namespace {
 const unsigned long ENTER_MS = 250;
-const unsigned long HOLD_MS = 500;
+// 1.5s of no further encoder increment/decrement (main.cpp's loop() calls
+// trigger() on every raw movement now, not just a completed detent - see
+// its own comment) - bumped from an initial 500ms 2026-08-11 per direct
+// feedback that the tablets vanished too eagerly once "any movement resets
+// the timer" made them appear much earlier in a turn too.
+const unsigned long HOLD_MS = 1500;
 const unsigned long EXIT_MS = 200;
 
 // 240x240 display, center at (120,120). Tablets sit near the top edge but
