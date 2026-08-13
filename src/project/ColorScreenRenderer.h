@@ -43,14 +43,23 @@ public:
   // partial single-object update) is used for this: cheap enough on a
   // color LCD with no e-paper ghosting concern to optimize around, same
   // reasoning as the existing MQTT-triggered redraw path.
-  bool renderScreen(int screenIndex, const String& pressedButtonId = "");
+  // pendingSwitchId/pendingSwitchStateIndex: while a Switch's tapped
+  // segment is awaiting MQTT confirmation (main.cpp's 3s pending/timeout
+  // state machine), that one segment draws the pending look instead of its
+  // normal active/inactive one - same "pass the one runtime highlight down
+  // through render" pattern as pressedButtonId, just keyed by (object id,
+  // segment index) instead of just an id, since a Switch has more than one
+  // sub-region that can independently need this.
+  bool renderScreen(int screenIndex, const String& pressedButtonId = "", const String& pendingSwitchId = "",
+                     int pendingSwitchStateIndex = -1);
 
 private:
   IProjectLoader& projectLoader_;
   ClippedCanvas16* canvas_;
   U8G2_FOR_ADAFRUIT_GFX u8g2_;
 
-  bool renderObject(const ScreenObject& obj, const String& pressedButtonId);
+  bool renderObject(const ScreenObject& obj, const String& pressedButtonId, const String& pendingSwitchId,
+                     int pendingSwitchStateIndex);
   bool renderBox(const ScreenObject& obj);
   bool renderLine(const ScreenObject& obj);
   bool renderLabel(const ScreenObject& obj);
@@ -59,9 +68,18 @@ private:
   bool renderMQTTIconField(const ScreenObject& obj);
   bool renderIcon(const ScreenObject& obj);
   bool renderSoftwareButton(const ScreenObject& obj, bool isPressed);
+  bool renderSwitch(const ScreenObject& obj, int pendingStateIndex);
 
   bool evaluateCondition(float value, const String& op, float threshold) const;
   String getIconPathForValue(const ScreenObject& obj, const String& valueStr) const;
+  // Index into obj.properties.states whose readValue (trimmed) equals the
+  // Switch's own topic's current value (also trimmed) - mirrors the
+  // designer's getActiveSwitchStateIndex() (render-switch.ts) exactly:
+  // plain trimmed String equality, not evaluateCondition()'s numeric
+  // operators (a state's readValue is arbitrary text, e.g. "high", not
+  // necessarily a number). -1 if no topic is set, no state matches, or no
+  // retained value has arrived yet.
+  int getActiveSwitchStateIndex(const ScreenObject& obj) const;
 
   void drawTextBox(const ScreenObject& obj, const String& displayText, bool drawBorder = true);
 

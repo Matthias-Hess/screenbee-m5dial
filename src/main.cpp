@@ -150,6 +150,33 @@ String pressedSoftButtonId = "";
 // this only applies to touch, not the front/rear buttons.
 bool suppressPressedButtonAction = false;
 
+// Id of the Switch segment currently held down by touch (empty = none) -
+// same drag-off-to-cancel semantics as pressedSoftButtonId, but a Switch
+// doesn't get a distinct "pressed" visual (unlike SoftwareButton's 3D
+// press effect) - nothing redraws on touch-down for a Switch, only on
+// touch-up (a tap is a single discrete "select this segment" gesture, see
+// this session's 2026-08-12 Switch design discussion for why cycling/
+// press-and-hold was explicitly rejected in favor of direct selection).
+String pressedSwitchId = "";
+int pressedSwitchStateIndex = -1;
+
+// The Switch segment awaiting MQTT confirmation after a tap (empty id = no
+// Switch pending). Set on touch-up (after publishing writeValue to
+// writeTopic, non-retained), cleared by checkPendingSwitchConfirmation()
+// either when a matching value arrives on the read topic within 3s
+// (confirmed - the render then just shows it "active" via the normal
+// topic-driven getActiveSwitchStateIndex() path, no separate "confirmed"
+// bookkeeping needed) or when 3s elapse without one (silent rollback to
+// whatever the topic actually says - no error UI, matching the "stiller
+// Rückfall" design decision). Deliberately not cleared on screen
+// navigation - a genuinely rare edge case (tap a Switch, navigate away,
+// navigate back, all within 3s) that isn't worth the extra bookkeeping to
+// chase across every screen-switch code path.
+String pendingSwitchId = "";
+int pendingSwitchStateIndex = -1;
+unsigned long pendingSwitchStartMs = 0;
+const unsigned long PENDING_SWITCH_TIMEOUT_MS = 3000;
+
 // Always overwrites (not "if missing") - these are bring-up fixtures that
 // change as object types get ported, not real persisted data; an
 // "if missing" guard bit us once already (a fixed test_project.h change
@@ -299,7 +326,16 @@ void onMqttMessage(const String& topic, const String& payload) {
   if (!screenUsesTopic(screen.objects, topic)) return;
 
   if (!screenRenderer) return;
-  if (!screenRenderer->renderScreen(currentScreenIndex)) {
+  // Passes the current pending-Switch state through (not defaults) - an
+  // unrelated topic update arriving during a Switch's up-to-3s pending
+  // window would otherwise redraw with pendingSwitchId="" and visibly (if
+  // briefly) hide the pending indicator before the next pending-aware
+  // redraw restored it. checkPendingSwitchConfirmation() (called from
+  // loop() right after mqttClient.loop(), which is what's dispatching this
+  // very callback) is still what actually decides whether pending should
+  // clear - this redraw just has to stay honest about whatever that
+  // decision currently is.
+  if (!screenRenderer->renderScreen(currentScreenIndex, "", pendingSwitchId, pendingSwitchStateIndex)) {
     Serial.println("[M5Dial] renderScreen() failed during MQTT-triggered redraw");
     return;
   }
@@ -759,6 +795,82 @@ const ScreenObject* findSoftwareButtonAt(int x, int y) {
   return best;
 }
 
+// Topmost Switch on the current screen whose rect contains (x, y), same
+// top-level-only scope as findSoftwareButtonAt (see its own comment) -
+// writes which segment within it via outStateIndex (segment width =
+// obj.width / states.size(), same division renderSwitch() uses). Returns
+// nullptr (outStateIndex untouched) if no Switch is hit, or the hit Switch
+// has zero states (nothing to select).
+const ScreenObject* findSwitchSegmentAt(int x, int y, int* outStateIndex) {
+  if (!projectLoader.isLoaded()) return nullptr;
+  const ProjectConfig& project = projectLoader.getProject();
+  if (currentScreenIndex < 0 || currentScreenIndex >= (int)project.screens.size()) return nullptr;
+
+  const ScreenObject* best = nullptr;
+  for (const auto& obj : project.screens[currentScreenIndex].objects) {
+    if (obj.type != "Switch") continue;
+    if (obj.properties.states.empty()) continue;
+    if (x < obj.x || x >= obj.x + obj.width || y < obj.y || y >= obj.y + obj.height) continue;
+    if (!best || obj.zIndex >= best->zIndex) best = &obj;
+  }
+  if (!best) return nullptr;
+
+  size_t stateCount = best->properties.states.size();
+  int segmentWidth = best->width / (int)stateCount;
+  int index = (x - best->x) / segmentWidth;
+  if (index >= (int)stateCount) index = (int)stateCount - 1;  // last segment absorbs the remainder, see renderSwitch()
+  if (outStateIndex) *outStateIndex = index;
+  return best;
+}
+
+// True if `obj`'s state at `stateIndex` is currently the one the read
+// topic's value actually resolves to - the single check both the
+// touch-up confirmation path and checkPendingSwitchConfirmation()'s
+// periodic poll need, kept in one place so they can't drift.
+bool switchStateMatchesTopic(const ScreenObject& obj, int stateIndex) {
+  if (stateIndex < 0 || stateIndex >= (int)obj.properties.states.size()) return false;
+  String topicValue = projectLoader.getTopicValue(obj.properties.topic);
+  topicValue.trim();
+  String readValue = obj.properties.states[stateIndex].readValue;
+  readValue.trim();
+  return readValue == topicValue;
+}
+
+// Called every loop() iteration (after mqttClient.loop(), so a
+// just-arrived retained confirmation is already reflected in
+// projectLoader's topic-value cache) - clears pendingSwitchId either
+// because the read topic now actually confirms pendingStateIndex, or
+// because PENDING_SWITCH_TIMEOUT_MS elapsed without that happening. Both
+// cases redraw once, immediately, rather than waiting for the next
+// MQTT-triggered or touch-triggered redraw - a pending indicator that only
+// disappeared "eventually, next time something else redraws" would be a
+// worse version of the exact "no feedback" problem the pending indicator
+// exists to solve.
+void checkPendingSwitchConfirmation() {
+  if (pendingSwitchId.isEmpty()) return;
+  if (!projectLoader.isLoaded()) return;
+
+  const ProjectConfig& project = projectLoader.getProject();
+  if (currentScreenIndex < 0 || currentScreenIndex >= (int)project.screens.size()) return;
+
+  bool confirmed = false;
+  for (const auto& obj : project.screens[currentScreenIndex].objects) {
+    if (obj.id != pendingSwitchId) continue;
+    confirmed = switchStateMatchesTopic(obj, pendingSwitchStateIndex);
+    break;
+  }
+  bool expired = millis() - pendingSwitchStartMs >= PENDING_SWITCH_TIMEOUT_MS;
+
+  if (confirmed || expired) {
+    pendingSwitchId = "";
+    pendingSwitchStateIndex = -1;
+    if (screenRenderer) {
+      screenRenderer->renderScreen(currentScreenIndex);
+      blitCanvasToDisplay();
+    }
+  }
+}
+
 void setup() {
   auto cfg = M5.config();
   // enableEncoder=false - M5Dial's own ENCODER class silently degrades to
@@ -1009,7 +1121,47 @@ void loop() {
     if (fire) dispatchButtonAction(actionToFire);
   }
 
+  // Switch tap handling - see findSwitchSegmentAt()'s own comment for the
+  // hit-test. Unlike SoftwareButton, nothing redraws on touch-down (a
+  // Switch has no distinct "pressed" visual) - only touch-up matters, and
+  // only if it lands on the same segment the touch-down did (same
+  // drag-off-to-cancel semantics as SoftwareButton). A confirmed tap
+  // immediately: publishes writeValue to writeTopic (not retained), marks
+  // that segment pending, and redraws once so the pending indicator shows
+  // up right away rather than waiting for the next unrelated redraw.
+  if (touchDown) {
+    int stateIndex = -1;
+    const ScreenObject* hit = findSwitchSegmentAt(touchDetail.x, touchDetail.y, &stateIndex);
+    pressedSwitchId = hit ? hit->id : "";
+    pressedSwitchStateIndex = hit ? stateIndex : -1;
+  } else if (touchUp && !pressedSwitchId.isEmpty()) {
+    int stillIndex = -1;
+    const ScreenObject* stillHit = findSwitchSegmentAt(touchDetail.x, touchDetail.y, &stillIndex);
+    bool fire = stillHit && stillHit->id == pressedSwitchId && stillIndex == pressedSwitchStateIndex &&
+                !suppressPressedButtonAction;
+
+    if (fire) {
+      const SwitchState& state = stillHit->properties.states[stillIndex];
+      // Already matches the read topic (e.g. a stale tap on the segment
+      // that's already active) - nothing to publish or wait for.
+      if (!switchStateMatchesTopic(*stillHit, stillIndex)) {
+        mqttClient.publish(stillHit->properties.writeTopic, state.writeValue, false);
+        pendingSwitchId = stillHit->id;
+        pendingSwitchStateIndex = stillIndex;
+        pendingSwitchStartMs = millis();
+      }
+    }
+
+    pressedSwitchId = "";
+    pressedSwitchStateIndex = -1;
+    if (fire && screenRenderer) {
+      screenRenderer->renderScreen(currentScreenIndex, "", pendingSwitchId, pendingSwitchStateIndex);
+      blitCanvasToDisplay();
+    }
+  }
+
   mqttClient.loop();
+  checkPendingSwitchConfirmation();
 
   // Handled here, not inside onMqttMessage() itself - see that function's
   // own comment for why. mqttClient.loop() above has fully returned by

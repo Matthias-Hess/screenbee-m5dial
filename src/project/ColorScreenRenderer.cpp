@@ -493,7 +493,165 @@ bool ColorScreenRenderer::renderSoftwareButton(const ScreenObject& obj, bool isP
   return true;
 }
 
-bool ColorScreenRenderer::renderObject(const ScreenObject& obj, const String& pressedButtonId) {
+int ColorScreenRenderer::getActiveSwitchStateIndex(const ScreenObject& obj) const {
+  if (obj.properties.topic.isEmpty()) return -1;
+  String topicValue = projectLoader_.getTopicValue(obj.properties.topic);
+  topicValue.trim();
+  for (size_t i = 0; i < obj.properties.states.size(); i++) {
+    String readValue = obj.properties.states[i].readValue;
+    readValue.trim();
+    if (readValue == topicValue) return (int)i;
+  }
+  return -1;
+}
+
+// Segmented control, one segment per obj.properties.states entry - mirrors
+// the designer's renderSwitch() (render-switch.ts) as closely as this
+// firmware's text/color primitives allow: same draw order (outer border,
+// then each segment's fill/divider/label left-to-right), same active-
+// segment resolution (getActiveSwitchStateIndex), same per-segment
+// clipping so an oversized font can't bleed into a neighboring segment
+// (2026-08-13 designer-side finding, ported here too). No icon drawing
+// yet - see SwitchState's own comment in ProjectTypes.h for why. No tap/
+// MQTT-write logic here either - that's main.cpp's job (findSwitchSegmentAt
+// + the pending/timeout state machine); this function only ever draws
+// whatever pendingStateIndex it's told, same "renderer just draws, main.cpp
+// owns the state machine" split as renderSoftwareButton's isPressed.
+bool ColorScreenRenderer::renderSwitch(const ScreenObject& obj, int pendingStateIndex) {
+  bool borderTransparent = false;
+  uint16_t borderColor = parseHexColor(obj.properties.borderColor, &borderTransparent);
+  if (!borderTransparent) {
+    canvas_->drawRect(obj.x, obj.y, obj.width, obj.height, borderColor);
+  }
+
+  size_t stateCount = obj.properties.states.size();
+  if (stateCount == 0) {
+    // Mirrors render-switch.ts's own "No states defined" placeholder - an
+    // empty/misconfigured Switch is still visible (and selectable, once
+    // touch hit-testing exists for it) instead of a blank box.
+    const uint8_t* placeholderFont = u8g2_font_helvR08_tf;
+    u8g2_.setFont(placeholderFont);
+    u8g2_.setFontMode(1);
+    u8g2_.setForegroundColor(0x8410);  // mid gray, no designer-side default to match (empty-state only)
+    String placeholder = "No states defined";
+    int16_t textWidth = measureTrueTextWidth(placeholder, placeholderFont);
+    int16_t textX = obj.x + jsRound((obj.width - textWidth) / 2.0f);
+    canvas_->setClip(obj.x, obj.y, obj.width, obj.height);
+    u8g2_.setCursor(textX, obj.y + obj.height / 2 + 4);
+    u8g2_.print(placeholder);
+    canvas_->clearClip();
+    return true;
+  }
+
+  int activeIndex = getActiveSwitchStateIndex(obj);
+
+  bool bgTransparent = false;
+  uint16_t bgColor = parseHexColor(obj.properties.backgroundColor, &bgTransparent);
+  uint16_t activeBgColor = parseHexColor(obj.properties.activeBackgroundColor);
+  uint16_t textColor = parseHexColor(obj.properties.textColor);
+  uint16_t activeTextColor = parseHexColor(obj.properties.activeTextColor);
+
+  const uint8_t* u8font = getU8g2FontById(obj.properties.fontId);
+  u8g2_.setFont(u8font);
+  u8g2_.setFontMode(1);
+  int16_t fontAscent = getFontAscentById(obj.properties.fontId);
+  int16_t fontDescent = getFontDescentById(obj.properties.fontId);
+  int16_t fontHeight = fontAscent + fontDescent;
+
+  int baseSegmentWidth = obj.width / (int)stateCount;
+
+  for (size_t i = 0; i < stateCount; i++) {
+    int segX = obj.x + (int)i * baseSegmentWidth;
+    // Last segment absorbs the integer-division remainder so segments
+    // always sum to exactly obj.width - the designer uses float division
+    // (obj.width / states.length) instead, close enough a difference to
+    // never matter on a display this size, but this keeps every pixel of
+    // obj.width accounted for rather than losing up to (stateCount-1) px
+    // off the right edge.
+    int segW = (i + 1 == stateCount) ? (obj.x + obj.width - segX) : baseSegmentWidth;
+
+    bool isPending = (int)i == pendingStateIndex;
+    bool isActive = (int)i == activeIndex && !isPending;
+
+    if (!bgTransparent) {
+      canvas_->fillRect(segX, obj.y, segW, obj.height, isActive ? activeBgColor : bgColor);
+    }
+
+    // Pending: a thicker border in the active color instead of a solid
+    // fill - visibly distinct from both "confirmed active" (solid fill)
+    // and "plain inactive" (thin border only) without needing an animation
+    // loop this single render call has no timer to drive. Mirrors the
+    // "loading indicator" decision from this session's Switch design
+    // discussion (2026-08-12) - main.cpp owns the actual 3s pending/
+    // timeout state machine that decides pendingStateIndex; this only
+    // draws whatever it's told.
+    if (isPending) {
+      for (int t = 0; t < 3; t++) {
+        int ringW = segW - 2 * t;
+        int ringH = obj.height - 2 * t;
+        if (ringW <= 0 || ringH <= 0) break;
+        canvas_->drawRect(segX + t, obj.y + t, ringW, ringH, activeBgColor);
+      }
+    }
+
+    // Divider between segments (not before the first one - the outer
+    // border already covers that edge), same skip-if-transparent as the
+    // outer border above.
+    if (i > 0 && !borderTransparent) {
+      canvas_->drawLine(segX, obj.y, segX, obj.y + obj.height - 1, borderColor);
+    }
+
+    const SwitchState& state = obj.properties.states[i];
+
+    // Icon - same iconSize/iconX/iconY formula as render-switch.ts and
+    // lib/asset-export.ts's exportSwitchStateIcon() (which is what actually
+    // baked state.iconPath's bitmap at this exact size/position), so the
+    // designer preview, the export bake, and this draw all agree. No
+    // placeholder-on-missing-asset here (unlike renderIcon/
+    // renderMQTTIconField) - an empty iconPath just means this state has no
+    // icon configured, not a load failure to flag.
+    int16_t iconBottom = obj.y;
+    bool hasIcon = !state.iconPath.isEmpty();
+    if (hasIcon) {
+      int iconSize = (int)fminf((float)(segW - 8), obj.height * 0.5f);
+      int iconX = segX + segW / 2 - iconSize / 2;
+      int iconY = obj.y + 4;
+      iconBottom = iconY + iconSize + 2;
+      ColorAssetLoader::drawBMPToCanvas(canvas_, state.iconPath, iconX, iconY);
+    }
+
+    if (state.label.isEmpty()) continue;
+
+    int16_t textWidth = measureTrueTextWidth(state.label, u8font);
+    int16_t maxWidth = segW - 4;
+    if (maxWidth > 0 && textWidth > maxWidth) textWidth = maxWidth;
+    int16_t textX = segX + jsRound((segW - textWidth) / 2.0f);
+    int16_t textY;
+    if (hasIcon) {
+      // Below the icon, top-anchored (not vertically centered in the whole
+      // segment) - matches render-switch.ts's anchorTop path.
+      textY = iconBottom + fontAscent;
+    } else {
+      int16_t verticalCenterOffset = jsRound((obj.height - fontHeight) / 2.0f);
+      textY = obj.y + verticalCenterOffset + fontAscent;
+    }
+
+    u8g2_.setForegroundColor(isActive ? activeTextColor : textColor);
+    // Clips to this segment's own rect, not the whole control - matches
+    // the designer's per-segment clip fix (2026-08-13): an oversized font
+    // gets cropped at the segment boundary instead of bleeding into a
+    // neighbor.
+    canvas_->setClip(segX, obj.y, segW, obj.height);
+    u8g2_.setCursor(textX, textY);
+    u8g2_.print(state.label);
+    canvas_->clearClip();
+  }
+
+  return true;
+}
+
+bool ColorScreenRenderer::renderObject(const ScreenObject& obj, const String& pressedButtonId,
+                                        const String& pendingSwitchId, int pendingSwitchStateIndex) {
   if (obj.type == "box") return renderBox(obj);
   if (obj.type == "line") return renderLine(obj);
   if (obj.type == "label") return renderLabel(obj);
@@ -502,13 +660,15 @@ bool ColorScreenRenderer::renderObject(const ScreenObject& obj, const String& pr
   if (obj.type == "MQTTIconField") return renderMQTTIconField(obj);
   if (obj.type == "icon") return renderIcon(obj);
   if (obj.type == "SoftwareButton") return renderSoftwareButton(obj, !pressedButtonId.isEmpty() && obj.id == pressedButtonId);
+  if (obj.type == "Switch") return renderSwitch(obj, obj.id == pendingSwitchId ? pendingSwitchStateIndex : -1);
 
   Serial.printf("[ColorScreenRenderer] Object type \"%s\" not implemented yet, skipping (id=%s)\n",
                 obj.type.c_str(), obj.id.c_str());
   return false;
 }
 
-bool ColorScreenRenderer::renderScreen(int screenIndex, const String& pressedButtonId) {
+bool ColorScreenRenderer::renderScreen(int screenIndex, const String& pressedButtonId, const String& pendingSwitchId,
+                                        int pendingSwitchStateIndex) {
   if (!projectLoader_.isLoaded()) return false;
 
   const ProjectConfig& project = projectLoader_.getProject();
@@ -525,7 +685,7 @@ bool ColorScreenRenderer::renderScreen(int screenIndex, const String& pressedBut
             [](const ScreenObject& a, const ScreenObject& b) { return a.zIndex < b.zIndex; });
 
   for (const auto& obj : sortedObjects) {
-    renderObject(obj, pressedButtonId);
+    renderObject(obj, pressedButtonId, pendingSwitchId, pendingSwitchStateIndex);
   }
 
   return true;

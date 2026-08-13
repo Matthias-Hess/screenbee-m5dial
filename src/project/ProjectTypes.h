@@ -22,6 +22,23 @@ struct CalibrationPoint {
   float barSizePercent;       // Bar fill percentage (0-100)
 };
 
+// One segment of a Switch object - mirrors the designer's SwitchState
+// (components/canvas/renderers/render-switch.ts) field-for-field.
+// `readValue` is matched (trimmed String equality) against the Switch's own
+// `topic` to decide which segment is "active"; `writeValue` is published
+// as-is (raw String, not retained) to the Switch's `writeTopic` when this
+// segment is tapped. `iconPath` mirrors ValueIconPair's `path` convention
+// but is always empty for now - the designer doesn't export a per-state
+// icon bitmap yet (2026-08-12 scoping decision, still open), so
+// renderSwitch() never draws one.
+struct SwitchState {
+  String id;
+  String label;
+  String readValue;
+  String writeValue;
+  String iconPath;
+};
+
 // One vertex of a (possibly multi-segment) line - mirrors the designer's
 // LinePoint (render-line.ts). Absolute screen coordinates, same as every
 // other object's own x/y.
@@ -135,9 +152,22 @@ struct ObjectProperties {
   // hardware buttons already use - see ButtonAction's own comment above.
   ButtonAction action;
 
+  // Switch properties - mirrors the designer's obj.properties shape
+  // (components/property-panel/switch-properties.tsx): `topic` (already
+  // declared above, shared with every other topic-bound type) is the read
+  // topic (retained); `writeTopic` is the command destination a tapped
+  // segment's writeValue gets published to (not retained). Segment
+  // background/text colors while active default to the same values the
+  // designer's Switch creation default does (canvas.tsx's Switch case).
+  String writeTopic;
+  String activeBackgroundColor;
+  String activeTextColor;
+  std::vector<SwitchState> states;
+
   ObjectProperties()
     : numberOfDecimals(2), fontSize(12), strokeWidth(1), cornerRadius(0), filletRadius(0),
-      arrowStart(false), arrowEnd(false) {}
+      arrowStart(false), arrowEnd(false),
+      activeBackgroundColor("#2563eb"), activeTextColor("#ffffff") {}
 };
 
 // Screen object (can be MQTTIconField, MqttDataField, tab-control, panel, etc.)

@@ -35,6 +35,7 @@ private:
   ScreenObject parseScreenObject(JsonObject objJson);
   ObjectProperties parseObjectProperties(JsonObject propsJson);
   std::vector<ValueIconPair> parseValueIconPairs(JsonArray pairsArray);
+  std::vector<SwitchState> parseSwitchStates(JsonArray statesArray);
   std::vector<CalibrationPoint> parseCalibrationPoints(JsonArray pointsArray);
   std::vector<Point> parseLinePoints(JsonArray pointsArray);
   ButtonAction parseButtonAction(JsonObject actionJson);

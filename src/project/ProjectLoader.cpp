@@ -333,7 +333,34 @@ ObjectProperties ProjectLoader::parseObjectProperties(JsonObject propsJson) {
     props.action = parseButtonAction(propsJson["action"].as<JsonObject>());
   }
 
+  // Switch properties - see ProjectTypes.h's ObjectProperties comment.
+  props.writeTopic = propsJson["writeTopic"] | "";
+  props.activeBackgroundColor = propsJson["activeBackgroundColor"] | "#2563eb";
+  props.activeTextColor = propsJson["activeTextColor"] | "#ffffff";
+  if (propsJson["states"].is<JsonArray>()) {
+    props.states = parseSwitchStates(propsJson["states"]);
+  }
+
   return props;
+}
+
+std::vector<SwitchState> ProjectLoader::parseSwitchStates(JsonArray statesArray) {
+  std::vector<SwitchState> states;
+
+  for (JsonObject stateJson : statesArray) {
+    SwitchState state;
+    state.id = stateJson["id"] | "";
+    state.label = stateJson["label"] | "";
+    state.readValue = stateJson["readValue"] | "";
+    state.writeValue = stateJson["writeValue"] | "";
+    // No `path` field to resolve yet - the designer doesn't export a
+    // per-state icon bitmap (see SwitchState's own comment in
+    // ProjectTypes.h), so this always stays empty for now.
+    state.iconPath = resolveAssetPath(stateJson["path"] | "");
+    states.push_back(state);
+  }
+
+  return states;
 }
 
 std::vector<ValueIconPair> ProjectLoader::parseValueIconPairs(JsonArray pairsArray) {
