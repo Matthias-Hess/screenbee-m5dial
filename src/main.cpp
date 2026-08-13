@@ -326,16 +326,16 @@ void onMqttMessage(const String& topic, const String& payload) {
   if (!screenUsesTopic(screen.objects, topic)) return;
 
   if (!screenRenderer) return;
-  // Passes the current pending-Switch state through (not defaults) - an
-  // unrelated topic update arriving during a Switch's up-to-3s pending
-  // window would otherwise redraw with pendingSwitchId="" and visibly (if
-  // briefly) hide the pending indicator before the next pending-aware
-  // redraw restored it. checkPendingSwitchConfirmation() (called from
-  // loop() right after mqttClient.loop(), which is what's dispatching this
-  // very callback) is still what actually decides whether pending should
-  // clear - this redraw just has to stay honest about whatever that
-  // decision currently is.
-  if (!screenRenderer->renderScreen(currentScreenIndex, "", pendingSwitchId, pendingSwitchStateIndex)) {
+  // Passes the current pending/pressed Switch state through (not defaults)
+  // - an unrelated topic update arriving mid-gesture would otherwise
+  // redraw with those cleared and visibly (if briefly) hide the indicator
+  // before the next aware redraw restored it. checkPendingSwitchConfirmation()
+  // (called from loop() right after mqttClient.loop(), which is what's
+  // dispatching this very callback) is still what actually decides whether
+  // pending should clear - this redraw just has to stay honest about
+  // whatever that decision currently is.
+  if (!screenRenderer->renderScreen(currentScreenIndex, "", pendingSwitchId, pendingSwitchStateIndex, pressedSwitchId,
+                                     pressedSwitchStateIndex)) {
     Serial.println("[M5Dial] renderScreen() failed during MQTT-triggered redraw");
     return;
   }
@@ -1122,18 +1122,23 @@ void loop() {
   }
 
   // Switch tap handling - see findSwitchSegmentAt()'s own comment for the
-  // hit-test. Unlike SoftwareButton, nothing redraws on touch-down (a
-  // Switch has no distinct "pressed" visual) - only touch-up matters, and
-  // only if it lands on the same segment the touch-down did (same
-  // drag-off-to-cancel semantics as SoftwareButton). A confirmed tap
-  // immediately: publishes writeValue to writeTopic (not retained), marks
-  // that segment pending, and redraws once so the pending indicator shows
-  // up right away rather than waiting for the next unrelated redraw.
+  // hit-test. Touch-down draws a thin pressed-border on the touched
+  // segment immediately (2026-08-14 addition - a tap previously gave no
+  // feedback at all until release). Touch-up only fires if it lands on the
+  // same segment the touch-down did (drag-off-to-cancel, same semantics as
+  // SoftwareButton). A confirmed tap immediately: publishes writeValue to
+  // writeTopic (not retained), marks that segment pending, and redraws
+  // once so the pending indicator shows up right away.
   if (touchDown) {
     int stateIndex = -1;
     const ScreenObject* hit = findSwitchSegmentAt(touchDetail.x, touchDetail.y, &stateIndex);
     pressedSwitchId = hit ? hit->id : "";
     pressedSwitchStateIndex = hit ? stateIndex : -1;
+    if (hit && screenRenderer) {
+      screenRenderer->renderScreen(currentScreenIndex, "", pendingSwitchId, pendingSwitchStateIndex, pressedSwitchId,
+                                    pressedSwitchStateIndex);
+      blitCanvasToDisplay();
+    }
   } else if (touchUp && !pressedSwitchId.isEmpty()) {
     int stillIndex = -1;
     const ScreenObject* stillHit = findSwitchSegmentAt(touchDetail.x, touchDetail.y, &stillIndex);
@@ -1154,8 +1159,14 @@ void loop() {
 
     pressedSwitchId = "";
     pressedSwitchStateIndex = -1;
-    if (fire && screenRenderer) {
-      screenRenderer->renderScreen(currentScreenIndex, "", pendingSwitchId, pendingSwitchStateIndex);
+    // Always redraw here, not just when fire - the pressed-border visual
+    // drawn on touch-down has to be cleared even when the tap was
+    // cancelled (dragged off before release, or suppressed as the touch
+    // that just woke the device), or it would stay stuck on screen with
+    // nothing else to clear it.
+    if (screenRenderer) {
+      screenRenderer->renderScreen(currentScreenIndex, "", pendingSwitchId, pendingSwitchStateIndex, pressedSwitchId,
+                                    pressedSwitchStateIndex);
       blitCanvasToDisplay();
     }
   }

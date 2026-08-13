@@ -50,8 +50,16 @@ public:
   // through render" pattern as pressedButtonId, just keyed by (object id,
   // segment index) instead of just an id, since a Switch has more than one
   // sub-region that can independently need this.
+  // pressedSwitchId/pressedSwitchStateIndex: while a Switch segment is
+  // actively being touched (finger still down, before release) - draws a
+  // blended background/text color (halfway between the segment's normal
+  // and active colors) so a press is felt immediately, distinct from both
+  // the plain idle look and the thicker-bordered pending look that
+  // replaces it the moment the finger lifts (2026-08-14 addition, agreed
+  // in this session's follow-up design discussion).
   bool renderScreen(int screenIndex, const String& pressedButtonId = "", const String& pendingSwitchId = "",
-                     int pendingSwitchStateIndex = -1);
+                     int pendingSwitchStateIndex = -1, const String& pressedSwitchId = "",
+                     int pressedSwitchStateIndex = -1);
 
 private:
   IProjectLoader& projectLoader_;
@@ -59,7 +67,7 @@ private:
   U8G2_FOR_ADAFRUIT_GFX u8g2_;
 
   bool renderObject(const ScreenObject& obj, const String& pressedButtonId, const String& pendingSwitchId,
-                     int pendingSwitchStateIndex);
+                     int pendingSwitchStateIndex, const String& pressedSwitchId, int pressedSwitchStateIndex);
   bool renderBox(const ScreenObject& obj);
   bool renderLine(const ScreenObject& obj);
   bool renderLabel(const ScreenObject& obj);
@@ -68,7 +76,7 @@ private:
   bool renderMQTTIconField(const ScreenObject& obj);
   bool renderIcon(const ScreenObject& obj);
   bool renderSoftwareButton(const ScreenObject& obj, bool isPressed);
-  bool renderSwitch(const ScreenObject& obj, int pendingStateIndex);
+  bool renderSwitch(const ScreenObject& obj, int pendingStateIndex, int pressedStateIndex);
 
   bool evaluateCondition(float value, const String& op, float threshold) const;
   String getIconPathForValue(const ScreenObject& obj, const String& valueStr) const;

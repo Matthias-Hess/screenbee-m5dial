@@ -353,10 +353,8 @@ std::vector<SwitchState> ProjectLoader::parseSwitchStates(JsonArray statesArray)
     state.label = stateJson["label"] | "";
     state.readValue = stateJson["readValue"] | "";
     state.writeValue = stateJson["writeValue"] | "";
-    // No `path` field to resolve yet - the designer doesn't export a
-    // per-state icon bitmap (see SwitchState's own comment in
-    // ProjectTypes.h), so this always stays empty for now.
     state.iconPath = resolveAssetPath(stateJson["path"] | "");
+    state.iconPathActive = resolveAssetPath(stateJson["pathActive"] | "");
     states.push_back(state);
   }
 

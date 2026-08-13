@@ -508,16 +508,15 @@ int ColorScreenRenderer::getActiveSwitchStateIndex(const ScreenObject& obj) cons
 // Segmented control, one segment per obj.properties.states entry - mirrors
 // the designer's renderSwitch() (render-switch.ts) as closely as this
 // firmware's text/color primitives allow: same draw order (outer border,
-// then each segment's fill/divider/label left-to-right), same active-
+// then each segment's fill/divider/icon/label left-to-right), same active-
 // segment resolution (getActiveSwitchStateIndex), same per-segment
 // clipping so an oversized font can't bleed into a neighboring segment
-// (2026-08-13 designer-side finding, ported here too). No icon drawing
-// yet - see SwitchState's own comment in ProjectTypes.h for why. No tap/
-// MQTT-write logic here either - that's main.cpp's job (findSwitchSegmentAt
-// + the pending/timeout state machine); this function only ever draws
-// whatever pendingStateIndex it's told, same "renderer just draws, main.cpp
-// owns the state machine" split as renderSoftwareButton's isPressed.
-bool ColorScreenRenderer::renderSwitch(const ScreenObject& obj, int pendingStateIndex) {
+// (2026-08-13 designer-side finding, ported here too). No tap/MQTT-write
+// logic here - that's main.cpp's job (findSwitchSegmentAt + the pending/
+// timeout state machine); this function only ever draws whatever
+// pendingStateIndex/pressedStateIndex it's told, same "renderer just draws,
+// main.cpp owns the state machine" split as renderSoftwareButton's isPressed.
+bool ColorScreenRenderer::renderSwitch(const ScreenObject& obj, int pendingStateIndex, int pressedStateIndex) {
   bool borderTransparent = false;
   uint16_t borderColor = parseHexColor(obj.properties.borderColor, &borderTransparent);
   if (!borderTransparent) {
@@ -571,20 +570,21 @@ bool ColorScreenRenderer::renderSwitch(const ScreenObject& obj, int pendingState
     int segW = (i + 1 == stateCount) ? (obj.x + obj.width - segX) : baseSegmentWidth;
 
     bool isPending = (int)i == pendingStateIndex;
+    bool isPressed = (int)i == pressedStateIndex && !isPending;
     bool isActive = (int)i == activeIndex && !isPending;
 
     if (!bgTransparent) {
       canvas_->fillRect(segX, obj.y, segW, obj.height, isActive ? activeBgColor : bgColor);
     }
 
-    // Pending: a thicker border in the active color instead of a solid
-    // fill - visibly distinct from both "confirmed active" (solid fill)
-    // and "plain inactive" (thin border only) without needing an animation
-    // loop this single render call has no timer to drive. Mirrors the
-    // "loading indicator" decision from this session's Switch design
-    // discussion (2026-08-12) - main.cpp owns the actual 3s pending/
-    // timeout state machine that decides pendingStateIndex; this only
-    // draws whatever it's told.
+    // Pending: a thicker (3px) border in the active color instead of a
+    // solid fill - visibly distinct from both "confirmed active" (solid
+    // fill) and "plain inactive" (thin border only) without needing an
+    // animation loop this single render call has no timer to drive.
+    // Mirrors the "loading indicator" decision from this session's Switch
+    // design discussion (2026-08-12) - main.cpp owns the actual 3s
+    // pending/timeout state machine that decides pendingStateIndex; this
+    // only draws whatever it's told.
     if (isPending) {
       for (int t = 0; t < 3; t++) {
         int ringW = segW - 2 * t;
@@ -592,6 +592,17 @@ bool ColorScreenRenderer::renderSwitch(const ScreenObject& obj, int pendingState
         if (ringW <= 0 || ringH <= 0) break;
         canvas_->drawRect(segX + t, obj.y + t, ringW, ringH, activeBgColor);
       }
+    }
+
+    // Pressed: a single thin (1px) border in the active color while the
+    // finger is still down, before release - immediate touch feedback,
+    // deliberately thinner than pending's 3px ring so the two remain
+    // visually distinct even though they're the same color (2026-08-14
+    // addition, follow-up to this session's original pending-indicator
+    // discussion once "does a press register at all" turned out to have no
+    // feedback whatsoever until release).
+    if (isPressed) {
+      canvas_->drawRect(segX, obj.y, segW, obj.height, activeBgColor);
     }
 
     // Divider between segments (not before the first one - the outer
@@ -605,19 +616,26 @@ bool ColorScreenRenderer::renderSwitch(const ScreenObject& obj, int pendingState
 
     // Icon - same iconSize/iconX/iconY formula as render-switch.ts and
     // lib/asset-export.ts's exportSwitchStateIcon() (which is what actually
-    // baked state.iconPath's bitmap at this exact size/position), so the
-    // designer preview, the export bake, and this draw all agree. No
-    // placeholder-on-missing-asset here (unlike renderIcon/
-    // renderMQTTIconField) - an empty iconPath just means this state has no
-    // icon configured, not a load failure to flag.
+    // baked this bitmap at this exact size/position), so the designer
+    // preview, the export bake, and this draw all agree. Picks
+    // iconPathActive over iconPath while the segment is showing its active
+    // fill - the two are baked against different backgrounds
+    // (backgroundColor vs. activeBackgroundColor) specifically so the
+    // icon's own backdrop always matches what's actually behind it
+    // (2026-08-14 fix: a single bake looked wrong the moment its segment
+    // went active). Falls back to iconPath if no active variant exists
+    // (an older export, before this fix). No placeholder-on-missing-asset
+    // here (unlike renderIcon/renderMQTTIconField) - an empty path just
+    // means this state has no icon configured, not a load failure to flag.
     int16_t iconBottom = obj.y;
-    bool hasIcon = !state.iconPath.isEmpty();
+    const String& iconPath = (isActive && !state.iconPathActive.isEmpty()) ? state.iconPathActive : state.iconPath;
+    bool hasIcon = !iconPath.isEmpty();
     if (hasIcon) {
       int iconSize = (int)fminf((float)(segW - 8), obj.height * 0.5f);
       int iconX = segX + segW / 2 - iconSize / 2;
       int iconY = obj.y + 4;
       iconBottom = iconY + iconSize + 2;
-      ColorAssetLoader::drawBMPToCanvas(canvas_, state.iconPath, iconX, iconY);
+      ColorAssetLoader::drawBMPToCanvas(canvas_, iconPath, iconX, iconY);
     }
 
     if (state.label.isEmpty()) continue;
@@ -651,7 +669,8 @@ bool ColorScreenRenderer::renderSwitch(const ScreenObject& obj, int pendingState
 }
 
 bool ColorScreenRenderer::renderObject(const ScreenObject& obj, const String& pressedButtonId,
-                                        const String& pendingSwitchId, int pendingSwitchStateIndex) {
+                                        const String& pendingSwitchId, int pendingSwitchStateIndex,
+                                        const String& pressedSwitchId, int pressedSwitchStateIndex) {
   if (obj.type == "box") return renderBox(obj);
   if (obj.type == "line") return renderLine(obj);
   if (obj.type == "label") return renderLabel(obj);
@@ -660,7 +679,11 @@ bool ColorScreenRenderer::renderObject(const ScreenObject& obj, const String& pr
   if (obj.type == "MQTTIconField") return renderMQTTIconField(obj);
   if (obj.type == "icon") return renderIcon(obj);
   if (obj.type == "SoftwareButton") return renderSoftwareButton(obj, !pressedButtonId.isEmpty() && obj.id == pressedButtonId);
-  if (obj.type == "Switch") return renderSwitch(obj, obj.id == pendingSwitchId ? pendingSwitchStateIndex : -1);
+  if (obj.type == "Switch") {
+    int pendingIndex = obj.id == pendingSwitchId ? pendingSwitchStateIndex : -1;
+    int pressedIndex = obj.id == pressedSwitchId ? pressedSwitchStateIndex : -1;
+    return renderSwitch(obj, pendingIndex, pressedIndex);
+  }
 
   Serial.printf("[ColorScreenRenderer] Object type \"%s\" not implemented yet, skipping (id=%s)\n",
                 obj.type.c_str(), obj.id.c_str());
@@ -668,7 +691,8 @@ bool ColorScreenRenderer::renderObject(const ScreenObject& obj, const String& pr
 }
 
 bool ColorScreenRenderer::renderScreen(int screenIndex, const String& pressedButtonId, const String& pendingSwitchId,
-                                        int pendingSwitchStateIndex) {
+                                        int pendingSwitchStateIndex, const String& pressedSwitchId,
+                                        int pressedSwitchStateIndex) {
   if (!projectLoader_.isLoaded()) return false;
 
   const ProjectConfig& project = projectLoader_.getProject();
@@ -685,7 +709,7 @@ bool ColorScreenRenderer::renderScreen(int screenIndex, const String& pressedBut
             [](const ScreenObject& a, const ScreenObject& b) { return a.zIndex < b.zIndex; });
 
   for (const auto& obj : sortedObjects) {
-    renderObject(obj, pressedButtonId, pendingSwitchId, pendingSwitchStateIndex);
+    renderObject(obj, pressedButtonId, pendingSwitchId, pendingSwitchStateIndex, pressedSwitchId, pressedSwitchStateIndex);
   }
 
   return true;

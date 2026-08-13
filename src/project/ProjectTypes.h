@@ -27,16 +27,19 @@ struct CalibrationPoint {
 // `readValue` is matched (trimmed String equality) against the Switch's own
 // `topic` to decide which segment is "active"; `writeValue` is published
 // as-is (raw String, not retained) to the Switch's `writeTopic` when this
-// segment is tapped. `iconPath` mirrors ValueIconPair's `path` convention
-// but is always empty for now - the designer doesn't export a per-state
-// icon bitmap yet (2026-08-12 scoping decision, still open), so
-// renderSwitch() never draws one.
+// segment is tapped. `iconPath`/`iconPathActive` mirror SoftwareButton's
+// pathNormal/pathActive split (ScreenObject below) - baked twice by the
+// designer's exportSwitchStateIcon() (lib/asset-export.ts) against the
+// segment's normal vs. active background color respectively, since the
+// segment's own fill changes live at runtime and a single fixed-background
+// bake would look wrong half the time (2026-08-14 finding).
 struct SwitchState {
   String id;
   String label;
   String readValue;
   String writeValue;
   String iconPath;
+  String iconPathActive;
 };
 
 // One vertex of a (possibly multi-segment) line - mirrors the designer's
