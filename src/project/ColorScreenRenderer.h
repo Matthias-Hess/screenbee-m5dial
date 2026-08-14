@@ -30,7 +30,7 @@
 // (lib/project-zip.ts's path/pathNormal/pathActive fields), not ported from
 // existing firmware logic.
 //
-// tab-control/panel/MqttDataLine (2026-08-15 port from MqttEPaperDisplay2's
+// tab-control/panel/MqttDataLine (2026-08-14 port from MqttEPaperDisplay2's
 // ScreenRenderer) reuse that firmware's logic near-verbatim, swapping only
 // parseColor()'s black/white result for parseHexColor()'s real RGB565 one -
 // the geometry (fillet math, thick-line rasterization, arrowhead placement,

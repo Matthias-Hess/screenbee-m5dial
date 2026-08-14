@@ -227,7 +227,7 @@ String stripJsonPath(const String& topicOrPath) {
 // collectTopics() (tab-control -> panel nesting) - written before
 // tab-control/panel were in the M5 Dial DDF's supportedObjectTypes so
 // children was always empty here, now exercised for real since the
-// 2026-08-15 rendering port (ColorScreenRenderer::renderTabControl).
+// 2026-08-14 rendering port (ColorScreenRenderer::renderTabControl).
 // Recursing here is what avoids silently missing nested topics' own
 // subscriptions and screenUsesTopic() redraw triggers (see
 // hil/combinations.js's own header comment for the exact bug this caused
@@ -779,7 +779,7 @@ void dispatchButtonAction(const ButtonAction& action) {
 // Topmost (highest zIndex) SoftwareButton on the current screen whose rect
 // contains (x, y), or nullptr if none - used by loop()'s touch handling.
 // Top-level objects only, deliberately: tab-control/panel rendering was
-// added 2026-08-15 (ColorScreenRenderer::renderTabControl), but touch
+// added 2026-08-14 (ColorScreenRenderer::renderTabControl), but touch
 // hit-testing was NOT extended to recurse into an active panel's children -
 // a SoftwareButton/Switch nested inside a panel renders correctly but isn't
 // tappable yet. Fixing that needs walking screen.objects for tab-controls,

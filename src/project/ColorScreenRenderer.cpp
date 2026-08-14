@@ -285,7 +285,7 @@ bool ColorScreenRenderer::renderBox(const ScreenObject& obj) {
   return true;
 }
 
-// Full parity with the e-paper reference (2026-08-15 port): fillet, thick
+// Full parity with the e-paper reference (2026-08-14 port): fillet, thick
 // strokes, fixed arrowheads, via the shared renderLineBody/fillThickLine/
 // drawArrowhead/shortenForArrow helpers below (see their own comments).
 bool ColorScreenRenderer::renderLine(const ScreenObject& obj) {
