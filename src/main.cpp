@@ -224,12 +224,14 @@ String stripJsonPath(const String& topicOrPath) {
 }
 
 // Recurses into obj.children for parity with the e-paper firmware's
-// collectTopics() (tab-control -> panel nesting) even though nothing in
-// the M5 Dial DDF's supportedObjectTypes includes tab-control/panel yet -
-// children is always empty here today, but this stays correct for free
-// once that changes instead of silently missing nested topics again (see
+// collectTopics() (tab-control -> panel nesting) - written before
+// tab-control/panel were in the M5 Dial DDF's supportedObjectTypes so
+// children was always empty here, now exercised for real since the
+// 2026-08-15 rendering port (ColorScreenRenderer::renderTabControl).
+// Recursing here is what avoids silently missing nested topics' own
+// subscriptions and screenUsesTopic() redraw triggers (see
 // hil/combinations.js's own header comment for the exact bug this caused
-// on the e-paper target the first time tab-control shipped).
+// on the e-paper target the first time tab-control shipped there).
 void collectTopics(const std::vector<ScreenObject>& objects, std::vector<String>& outTopics) {
   for (const auto& obj : objects) {
     if (!obj.properties.topic.isEmpty()) {
@@ -776,11 +778,14 @@ void dispatchButtonAction(const ButtonAction& action) {
 
 // Topmost (highest zIndex) SoftwareButton on the current screen whose rect
 // contains (x, y), or nullptr if none - used by loop()'s touch handling.
-// Top-level objects only: tab-control/panel nesting isn't in the M5 Dial
-// DDF's supportedObjectTypes yet (see docs/device-contract.md §1's own gap
-// note), so there's nothing under a SoftwareButton to recurse past, and
-// nothing above it either - every object on an M5 Dial screen today is a
-// direct child of the screen.
+// Top-level objects only, deliberately: tab-control/panel rendering was
+// added 2026-08-15 (ColorScreenRenderer::renderTabControl), but touch
+// hit-testing was NOT extended to recurse into an active panel's children -
+// a SoftwareButton/Switch nested inside a panel renders correctly but isn't
+// tappable yet. Fixing that needs walking screen.objects for tab-controls,
+// resolving each one's active panel (getActivePanel - currently private to
+// ColorScreenRenderer), and testing its children's offset rects too; out of
+// scope for the rendering-only port that introduced nesting here.
 const ScreenObject* findSoftwareButtonAt(int x, int y) {
   if (!projectLoader.isLoaded()) return nullptr;
   const ProjectConfig& project = projectLoader.getProject();

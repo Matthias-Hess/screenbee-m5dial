@@ -285,12 +285,56 @@ bool ColorScreenRenderer::renderBox(const ScreenObject& obj) {
   return true;
 }
 
-// Straight-segment lines only so far (properties.points if set, else the
-// (x,y)-to-(x+width,y+height) fallback - matches the designer's
-// getLinePoints()) - no fillet/arrowhead/thick-line yet, tracked as
-// follow-up work alongside the other not-yet-ported object types (see
-// this class's header comment).
+// Full parity with the e-paper reference (2026-08-15 port): fillet, thick
+// strokes, fixed arrowheads, via the shared renderLineBody/fillThickLine/
+// drawArrowhead/shortenForArrow helpers below (see their own comments).
 bool ColorScreenRenderer::renderLine(const ScreenObject& obj) {
+  uint16_t color = parseHexColor(obj.properties.color);
+  float strokeWidth = (float)obj.properties.strokeWidth;
+
+  std::vector<Point> points = obj.properties.points;
+  if (points.size() < 2) {
+    points.clear();
+    points.push_back({obj.x, obj.y});
+    points.push_back({obj.x + obj.width, obj.y + obj.height});
+  }
+
+  // strokeStyle other than "solid" (dashed/dotted) isn't supported by this
+  // device yet - draw solid regardless, same as the designer's fallback.
+  auto drawSegment = [&](int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+    if (strokeWidth > 1) {
+      fillThickLine(x0, y0, x1, y1, strokeWidth, color);
+    } else {
+      canvas_->drawLine(x0, y0, x1, y1, color);
+    }
+  };
+
+  // Manual, fixed arrowheads (as opposed to MqttDataLine's data-driven
+  // ones) - independent start/end flags. The body is drawn shortened at
+  // whichever end(s) show one - see shortenForArrow()'s comment for why.
+  bool arrowStart = points.size() >= 2 && obj.properties.arrowStart;
+  bool arrowEnd = points.size() >= 2 && obj.properties.arrowEnd;
+
+  std::vector<Point> bodyPoints = points;
+  if (arrowStart) bodyPoints[0] = shortenForArrow(points[0], points[1], strokeWidth);
+  if (arrowEnd) {
+    bodyPoints[bodyPoints.size() - 1] = shortenForArrow(points[points.size() - 1], points[points.size() - 2], strokeWidth);
+  }
+  renderLineBody(bodyPoints, obj.properties.filletRadius, drawSegment);
+
+  if (arrowStart) drawArrowhead(points[0], points[1], strokeWidth, color);
+  if (arrowEnd) drawArrowhead(points[points.size() - 1], points[points.size() - 2], strokeWidth, color);
+
+  return true;
+}
+
+// MqttDataLine: like renderLine but stroke width is data-driven
+// (calibrationPoints maps abs(topic value) to a px width) and arrow
+// presence at each end is independently evaluated against the topic's
+// signed value (arrowStartOperator/Value, arrowEndOperator/Value), instead
+// of renderLine's fixed booleans. Ported near-verbatim from
+// MqttEPaperDisplay2's ScreenRenderer::renderMqttDataLine().
+bool ColorScreenRenderer::renderMqttDataLine(const ScreenObject& obj) {
   uint16_t color = parseHexColor(obj.properties.color);
 
   std::vector<Point> points = obj.properties.points;
@@ -300,10 +344,260 @@ bool ColorScreenRenderer::renderLine(const ScreenObject& obj) {
     points.push_back({obj.x + obj.width, obj.y + obj.height});
   }
 
-  for (size_t i = 0; i + 1 < points.size(); i++) {
-    canvas_->drawLine(points[i].x, points[i].y, points[i + 1].x, points[i + 1].y, color);
+  String rawValue = projectLoader_.getTopicValue(obj.properties.topic);
+  float numericValue = rawValue.toFloat();
+
+  // abs() - magnitude drives width, sign drives direction (the arrow
+  // conditions below use rawValue, the signed string, directly). Falls back
+  // to the same default calibration the designer's toolbar/property panel
+  // pre-populates a new MqttDataLine with, rather than
+  // interpolateCalibration()'s own generic empty-vector fallback (returning
+  // the raw value unclamped, which for a magnitude like 75 would mean a
+  // 75px-wide line).
+  std::vector<CalibrationPoint> calibrationPoints = obj.properties.calibrationPoints;
+  if (calibrationPoints.empty()) {
+    calibrationPoints = {{0.0f, 1.0f}, {100.0f, 6.0f}};
   }
+  float strokeWidth = fmaxf(1.0f, roundf(interpolateCalibration(fabsf(numericValue), calibrationPoints)));
+
+  auto drawSegment = [&](int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+    if (strokeWidth > 1) {
+      fillThickLine(x0, y0, x1, y1, strokeWidth, color);
+    } else {
+      canvas_->drawLine(x0, y0, x1, y1, color);
+    }
+  };
+
+  bool arrowStart = points.size() >= 2 &&
+      evaluateVisibilityCondition(rawValue, obj.properties.arrowStartOperator, obj.properties.arrowStartValue);
+  bool arrowEnd = points.size() >= 2 &&
+      evaluateVisibilityCondition(rawValue, obj.properties.arrowEndOperator, obj.properties.arrowEndValue);
+
+  // Body shortened at whichever end(s) show an arrow - see
+  // shortenForArrow()'s comment. Matters more here than on a plain line: a
+  // flow line's whole point is a data-driven, potentially very thick stroke.
+  std::vector<Point> bodyPoints = points;
+  if (arrowStart) bodyPoints[0] = shortenForArrow(points[0], points[1], strokeWidth);
+  if (arrowEnd) {
+    bodyPoints[bodyPoints.size() - 1] = shortenForArrow(points[points.size() - 1], points[points.size() - 2], strokeWidth);
+  }
+  renderLineBody(bodyPoints, obj.properties.filletRadius, drawSegment);
+
+  if (arrowStart) drawArrowhead(points[0], points[1], strokeWidth, color);
+  if (arrowEnd) drawArrowhead(points[points.size() - 1], points[points.size() - 2], strokeWidth, color);
+
   return true;
+}
+
+void ColorScreenRenderer::renderLineBody(const std::vector<Point>& points, int filletRadius,
+                                          const std::function<void(int16_t, int16_t, int16_t, int16_t)>& drawSegment) {
+  if (filletRadius <= 0 || points.size() < 3) {
+    for (size_t i = 0; i + 1 < points.size(); i++) {
+      drawSegment(points[i].x, points[i].y, points[i + 1].x, points[i + 1].y);
+    }
+    return;
+  }
+
+  renderFilletedLine(points, filletRadius, drawSegment);
+}
+
+void ColorScreenRenderer::drawArrowhead(const Point& tip, const Point& from, float strokeWidth, uint16_t color) {
+  float dx = (float)(tip.x - from.x);
+  float dy = (float)(tip.y - from.y);
+  float len = hypotf(dx, dy);
+  if (len == 0.0f) return;
+
+  float dirX = dx / len;
+  float dirY = dy / len;
+  float perpX = -dirY;
+  float perpY = dirX;
+
+  float arrowLength = fmaxf(6.0f, strokeWidth * 3.0f);
+  float arrowHalfWidth = fmaxf(4.0f, strokeWidth * 2.0f);
+
+  float backX = tip.x - dirX * arrowLength;
+  float backY = tip.y - dirY * arrowLength;
+
+  int16_t tipX = (int16_t)roundf((float)tip.x);
+  int16_t tipY = (int16_t)roundf((float)tip.y);
+  int16_t p1x = (int16_t)roundf(backX + perpX * arrowHalfWidth);
+  int16_t p1y = (int16_t)roundf(backY + perpY * arrowHalfWidth);
+  int16_t p2x = (int16_t)roundf(backX - perpX * arrowHalfWidth);
+  int16_t p2y = (int16_t)roundf(backY - perpY * arrowHalfWidth);
+
+  canvas_->fillTriangle(tipX, tipY, p1x, p1y, p2x, p2y, color);
+}
+
+Point ColorScreenRenderer::shortenForArrow(const Point& tip, const Point& from, float strokeWidth) {
+  float dx = (float)(tip.x - from.x);
+  float dy = (float)(tip.y - from.y);
+  float len = hypotf(dx, dy);
+  if (len == 0.0f) return tip;
+
+  float dirX = dx / len;
+  float dirY = dy / len;
+  float arrowLength = fmaxf(6.0f, strokeWidth * 3.0f);
+  // Clamped so a very short final segment can't shorten past its own start
+  // and invert the segment.
+  float shortenBy = fminf(arrowLength * 0.25f, len * 0.9f);
+
+  return {(int16_t)roundf(tip.x - dirX * shortenBy), (int16_t)roundf(tip.y - dirY * shortenBy)};
+}
+
+// Rounds every interior vertex of a multi-point line via a true circular
+// arc between tangent points - see MqttEPaperDisplay2's ScreenRenderer::
+// renderFilletedLine() for the full tangent/arc-center derivation and the
+// 2026-07-30 finding on why a Bezier approximation looked visibly wrong at
+// sharp angles. Ported verbatim (color-depth-independent geometry).
+void ColorScreenRenderer::renderFilletedLine(const std::vector<Point>& points, int filletRadius,
+                                              const std::function<void(int16_t, int16_t, int16_t, int16_t)>& drawSegment) {
+  const int CURVE_STEPS = 16;
+  Point segStart = points[0];
+
+  for (size_t i = 1; i + 1 < points.size(); i++) {
+    const Point& prev = points[i - 1];
+    const Point& curr = points[i];
+    const Point& next = points[i + 1];
+
+    float lenIn = hypotf((float)(curr.x - prev.x), (float)(curr.y - prev.y));
+    float lenOut = hypotf((float)(next.x - curr.x), (float)(next.y - curr.y));
+    float maxDist = fminf(lenIn / 2.0f, lenOut / 2.0f);
+
+    Point t1, t2;
+    float effectiveRadius = 0.0f;
+    float centerX = 0.0f, centerY = 0.0f;
+    bool haveArc = false;
+
+    if (lenIn <= 0.0f || lenOut <= 0.0f || maxDist <= 0.0f) {
+      t1 = curr;
+      t2 = curr;
+    } else {
+      float v1x = (prev.x - curr.x) / lenIn, v1y = (prev.y - curr.y) / lenIn;
+      float v2x = (next.x - curr.x) / lenOut, v2y = (next.y - curr.y) / lenOut;
+      float dotP = v1x * v2x + v1y * v2y;
+      if (dotP > 1.0f) dotP = 1.0f;
+      if (dotP < -1.0f) dotP = -1.0f;
+      float halfAngle = acosf(dotP) / 2.0f;
+      float tanHalfAngle = tanf(halfAngle);
+      float sinHalfAngle = sinf(halfAngle);
+
+      float tangentDist = (tanHalfAngle > 1e-4f) ? (filletRadius / tanHalfAngle) : maxDist;
+      if (tangentDist > maxDist) tangentDist = maxDist;
+      effectiveRadius = tangentDist * tanHalfAngle;
+
+      t1 = {(int16_t)roundf(curr.x + v1x * tangentDist), (int16_t)roundf(curr.y + v1y * tangentDist)};
+      t2 = {(int16_t)roundf(curr.x + v2x * tangentDist), (int16_t)roundf(curr.y + v2y * tangentDist)};
+
+      if (effectiveRadius > 0.0f && sinHalfAngle > 1e-4f) {
+        float bx = v1x + v2x, by = v1y + v2y;
+        float bLen = hypotf(bx, by);
+        if (bLen > 1e-4f) {
+          bx /= bLen;
+          by /= bLen;
+          float centerDist = effectiveRadius / sinHalfAngle;
+          centerX = curr.x + bx * centerDist;
+          centerY = curr.y + by * centerDist;
+          haveArc = true;
+        }
+      }
+    }
+
+    drawSegment(segStart.x, segStart.y, t1.x, t1.y);
+
+    if (haveArc) {
+      const float kPi = 3.14159265358979323846f;
+      float startAngle = atan2f(t1.y - centerY, t1.x - centerX);
+      float endAngle = atan2f(t2.y - centerY, t2.x - centerX);
+      float delta = endAngle - startAngle;
+      while (delta > kPi) delta -= 2.0f * kPi;
+      while (delta < -kPi) delta += 2.0f * kPi;
+
+      Point prevCurvePoint = t1;
+      for (int s = 1; s <= CURVE_STEPS; s++) {
+        float t = (float)s / (float)CURVE_STEPS;
+        float angle = startAngle + delta * t;
+        float px = centerX + effectiveRadius * cosf(angle);
+        float py = centerY + effectiveRadius * sinf(angle);
+        Point curvePoint = {(int16_t)roundf(px), (int16_t)roundf(py)};
+        drawSegment(prevCurvePoint.x, prevCurvePoint.y, curvePoint.x, curvePoint.y);
+        prevCurvePoint = curvePoint;
+      }
+    }
+
+    segStart = t2;
+  }
+
+  const Point& last = points[points.size() - 1];
+  drawSegment(segStart.x, segStart.y, last.x, last.y);
+}
+
+// Fills a strokeWidth>1 line as a rotated rectangle with butt caps - see
+// MqttEPaperDisplay2's ScreenRenderer::fillThickLine() for the full
+// rotated-rectangle inside-test derivation. Ported verbatim except the
+// final canvas_->drawPixel() call, which now writes a real RGB565 color
+// instead of a 1-bit black/white value - Adafruit_GFX's drawPixel()
+// signature is otherwise identical between ClippedCanvas1 and
+// ClippedCanvas16.
+void ColorScreenRenderer::fillThickLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, float width, uint16_t color) {
+  double dx = (double)x1 - (double)x0;
+  double dy = (double)y1 - (double)y0;
+  double len = sqrt(dx * dx + dy * dy);
+  if (len == 0.0) return;  // degenerate (zero-length, butt caps draw nothing)
+
+  double nx = -dy / len;
+  double ny = dx / len;
+  double hw = (double)width / 2.0;
+
+  // Rectangle corners, in order around the perimeter (A->B->C->D->A):
+  // A/B are the two ends of the start cap, C/D the two ends of the end cap.
+  double ax = (double)x0 + nx * hw, ay = (double)y0 + ny * hw;
+  double bx = (double)x0 - nx * hw, by = (double)y0 - ny * hw;
+  double cx = (double)x1 - nx * hw, cy = (double)y1 - ny * hw;
+  double dxp = (double)x1 + nx * hw, dyp = (double)y1 + ny * hw;
+  double cornersX[4] = {ax, bx, cx, dxp};
+  double cornersY[4] = {ay, by, cy, dyp};
+
+  double minXd = cornersX[0], maxXd = cornersX[0];
+  double minYd = cornersY[0], maxYd = cornersY[0];
+  for (int i = 1; i < 4; i++) {
+    if (cornersX[i] < minXd) minXd = cornersX[i];
+    if (cornersX[i] > maxXd) maxXd = cornersX[i];
+    if (cornersY[i] < minYd) minYd = cornersY[i];
+    if (cornersY[i] > maxYd) maxYd = cornersY[i];
+  }
+  int16_t minX = (int16_t)floor(minXd);
+  int16_t maxX = (int16_t)ceil(maxXd);
+  int16_t minY = (int16_t)floor(minYd);
+  int16_t maxY = (int16_t)ceil(maxYd);
+
+  for (int16_t py = minY; py <= maxY; py++) {
+    for (int16_t px = minX; px <= maxX; px++) {
+      double testX = (double)px + 0.5;
+      double testY = (double)py + 0.5;
+      int sign = 0;
+      bool inside = true;
+      for (int i = 0; i < 4; i++) {
+        int j = (i + 1) % 4;
+        double edgeX = cornersX[j] - cornersX[i];
+        double edgeY = cornersY[j] - cornersY[i];
+        double toPointX = testX - cornersX[i];
+        double toPointY = testY - cornersY[i];
+        double cross = edgeX * toPointY - edgeY * toPointX;
+        if (cross != 0.0) {
+          int s = (cross > 0.0) ? 1 : -1;
+          if (sign == 0) {
+            sign = s;
+          } else if (s != sign) {
+            inside = false;
+            break;
+          }
+        }
+      }
+      if (inside) {
+        canvas_->drawPixel(px, py, color);
+      }
+    }
+  }
 }
 
 bool ColorScreenRenderer::renderMQTTDataField(const ScreenObject& obj) {
@@ -439,6 +733,21 @@ bool ColorScreenRenderer::evaluateCondition(float value, const String& op, float
   if (op == "==" || op == "=") return value == threshold;
   if (op == "!=") return value != threshold;
   return false;
+}
+
+bool ColorScreenRenderer::evaluateVisibilityCondition(const String& actualValue, const String& op, const String& comparisonValue) const {
+  if (op == "==" || op == "!=") {
+    String a = actualValue;
+    String b = comparisonValue;
+    a.trim();
+    b.trim();
+    bool matches = (a == b);
+    return op == "==" ? matches : !matches;
+  }
+  // Numeric operators: String::toFloat() returns 0.0 for a non-numeric
+  // string (not NaN), on both sides here, matching Arduino's own
+  // conversion semantics exactly.
+  return evaluateCondition(actualValue.toFloat(), op, comparisonValue.toFloat());
 }
 
 String ColorScreenRenderer::getIconPathForValue(const ScreenObject& obj, const String& valueStr) const {
@@ -668,6 +977,56 @@ bool ColorScreenRenderer::renderSwitch(const ScreenObject& obj, int pendingState
   return true;
 }
 
+const ScreenObject* ColorScreenRenderer::getActivePanel(const ScreenObject& tabControl) const {
+  String topicValue = projectLoader_.getTopicValue(tabControl.properties.topic);
+
+  // zIndex order among the panel siblings, first match wins - same
+  // "walk in order, return first match" shape as getIconPathForValue().
+  std::vector<const ScreenObject*> sortedPanels;
+  for (const auto& panel : tabControl.children) {
+    sortedPanels.push_back(&panel);
+  }
+  std::sort(sortedPanels.begin(), sortedPanels.end(),
+    [](const ScreenObject* a, const ScreenObject* b) {
+      return a->zIndex < b->zIndex;
+    });
+
+  for (const ScreenObject* panel : sortedPanels) {
+    if (evaluateVisibilityCondition(topicValue, panel->properties.comparisonOperator, panel->properties.comparisonValue)) {
+      return panel;
+    }
+  }
+  return nullptr;
+}
+
+bool ColorScreenRenderer::renderTabControl(const ScreenObject& obj, const String& pressedButtonId,
+                                            const String& pendingSwitchId, int pendingSwitchStateIndex,
+                                            const String& pressedSwitchId, int pressedSwitchStateIndex) {
+  const ScreenObject* activePanel = getActivePanel(obj);
+  if (activePanel == nullptr) return true;  // No panel matches - draw nothing.
+
+  // zIndex order among the panel's own children, same as renderScreen()'s
+  // top-level sort.
+  std::vector<ScreenObject> sortedChildren = activePanel->children;
+  std::sort(sortedChildren.begin(), sortedChildren.end(),
+    [](const ScreenObject& a, const ScreenObject& b) {
+      return a.zIndex < b.zIndex;
+    });
+
+  for (const auto& child : sortedChildren) {
+    // Child coordinates are relative to the tab-control's own origin, not
+    // absolute screen coordinates - offset by (obj.x, obj.y) before
+    // recursing through the normal dispatch. Accumulates correctly through
+    // arbitrarily deep nesting since each level's children are already
+    // offset-adjusted by the time a nested tab-control applies its own.
+    ScreenObject offsetChild = child;
+    offsetChild.x += obj.x;
+    offsetChild.y += obj.y;
+    renderObject(offsetChild, pressedButtonId, pendingSwitchId, pendingSwitchStateIndex, pressedSwitchId, pressedSwitchStateIndex);
+  }
+  return true;
+}
+
 bool ColorScreenRenderer::renderObject(const ScreenObject& obj, const String& pressedButtonId,
                                         const String& pendingSwitchId, int pendingSwitchStateIndex,
                                         const String& pressedSwitchId, int pressedSwitchStateIndex) {
@@ -683,6 +1042,16 @@ bool ColorScreenRenderer::renderObject(const ScreenObject& obj, const String& pr
     int pendingIndex = obj.id == pendingSwitchId ? pendingSwitchStateIndex : -1;
     int pressedIndex = obj.id == pressedSwitchId ? pressedSwitchStateIndex : -1;
     return renderSwitch(obj, pendingIndex, pressedIndex);
+  }
+  if (obj.type == "MqttDataLine") return renderMqttDataLine(obj);
+  if (obj.type == "tab-control") {
+    return renderTabControl(obj, pressedButtonId, pendingSwitchId, pendingSwitchStateIndex, pressedSwitchId, pressedSwitchStateIndex);
+  }
+  if (obj.type == "panel") {
+    // Only ever meaningful as a tab-control's own child, handled by
+    // renderTabControl() above - a stray top-level "panel" (malformed
+    // data) draws nothing, matching the e-paper reference's identical no-op.
+    return true;
   }
 
   Serial.printf("[ColorScreenRenderer] Object type \"%s\" not implemented yet, skipping (id=%s)\n",
