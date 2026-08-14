@@ -142,7 +142,24 @@ bool DeployManager::downloadToFile(const String& url, const String& destPath, st
     size_t toRead = avail < sizeof(buf) ? avail : sizeof(buf);
     int got = stream->readBytes(buf, toRead);
     if (got <= 0) break;
-    f.write(buf, got);
+    // Checked, not assumed (2026-08-11) - LittleFS.write() can write fewer
+    // bytes than asked (or 0) when the filesystem fills up mid-download,
+    // and `written` used to be incremented by `got` regardless. That let a
+    // disk-full download still report "Downloaded N bytes (expected N) -
+    // ok" (byte COUNT matched, since it counted what was read from the
+    // network, not what actually landed on flash) and only fail much later
+    // at CRC32 verification - surfacing as a confusing "Checksum mismatch"
+    // instead of an honest out-of-space error. Found live: LittleFS logged
+    // "No more free space" repeatedly during a real deploy while this loop
+    // kept reporting normal progress the whole time.
+    size_t wroteNow = f.write(buf, got);
+    if (wroteNow != (size_t)got) {
+      Serial.printf("[DeployManager] Write failed at byte %d (wrote %u of %d) - likely out of space\n",
+                    written, (unsigned)wroteNow, got);
+      f.close();
+      http.end();
+      return false;
+    }
     written += got;
 
     // Report every 10%, not every 1% - a progress bar can't tell the
@@ -163,6 +180,25 @@ bool DeployManager::downloadToFile(const String& url, const String& destPath, st
 
   f.close();
   http.end();
+
+  // The per-write check above can't catch everything on its own: LittleFS
+  // caches, so a write can be acknowledged in full and only actually fail
+  // when that cache is flushed at close() - which returns void here, so
+  // there's nothing to check. Reading the file's real size back is the one
+  // check that can't be fooled, and it closes exactly the assumption that
+  // made the original bug so confusing: `written` counts bytes taken off
+  // the network, not bytes that reached flash.
+  size_t onDisk = 0;
+  File check = LittleFS.open(destPath, "r");
+  if (check) {
+    onDisk = check.size();
+    check.close();
+  }
+  if (onDisk != (size_t)written) {
+    Serial.printf("[DeployManager] Only %u of %d bytes reached flash - likely out of space\n",
+                  (unsigned)onDisk, written);
+    return false;
+  }
 
   bool ok = (totalLen < 0) || (written == totalLen);
   Serial.printf("[DeployManager] Downloaded %d bytes (expected %d) - %s\n", written, totalLen, ok ? "ok" : "short read");
