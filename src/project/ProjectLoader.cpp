@@ -1,4 +1,5 @@
 #include "ProjectLoader.h"
+#include <exception>
 
 namespace {
 // Every asset path stored in project.json (icon `path`, SoftwareButton
@@ -83,7 +84,22 @@ bool ProjectLoader::parseJSONFromFile(File& file) {
   if (error) {
     return false;
   }
-  return parseJSONDocument(doc);
+
+  // Safety net, not the fix itself - parseScreens()'s reserve() calls are
+  // what actually prevent the allocation spike this guards against. Kept
+  // regardless: reserve() can itself still throw std::bad_alloc if even a
+  // single correctly-sized allocation doesn't fit (a project so large the
+  // ESP.getMaxAllocHeap() check above, measured before this document's own
+  // large buffer existed, no longer reflects reality) - same "fail this
+  // one load, don't take the device down" outcome the check above already
+  // establishes as this function's contract, just covering the case that
+  // check can't predict.
+  try {
+    return parseJSONDocument(doc);
+  } catch (const std::exception& e) {
+    Serial.printf("[ProjectLoader] Exception while parsing %s: %s\n", file.name(), e.what());
+    return false;
+  }
 }
 
 bool ProjectLoader::parseJSON(const String& jsonContent) {
@@ -107,8 +123,14 @@ bool ProjectLoader::parseJSON(const String& jsonContent) {
   if (error) {
     return false;
   }
-  
-  return parseJSONDocument(doc);
+
+  // See parseJSONFromFile()'s identical try/catch for why.
+  try {
+    return parseJSONDocument(doc);
+  } catch (const std::exception& e) {
+    Serial.printf("[ProjectLoader] Exception while parsing project JSON: %s\n", e.what());
+    return false;
+  }
 }
 
 bool ProjectLoader::parseJSONDocument(JsonDocument& doc) {
@@ -177,7 +199,12 @@ void ProjectLoader::parseTopics(JsonArray topicsArray) {
 
 void ProjectLoader::parseFonts(JsonArray fontsArray) {
   project_.fonts.clear();
-  
+  // See parseScreens()'s identical reserve() calls for why - avoids
+  // std::vector's doubling-reallocation strategy needing the old *and* new
+  // buffer simultaneously mid-loop, on top of whatever the DynamicJsonDocument
+  // this array lives in has already claimed.
+  project_.fonts.reserve(fontsArray.size());
+
   for (JsonObject fontJson : fontsArray) {
     Font font;
     font.id = fontJson["id"] | "";
@@ -193,6 +220,23 @@ void ProjectLoader::parseFonts(JsonArray fontsArray) {
 }
 
 void ProjectLoader::parseScreens(JsonArray screensArray) {
+  // Root cause of a real boot crash found flashing real hardware
+  // (2026-08-15): std::vector<ScreenObject>::push_back() below grows by
+  // doubling, which needs the old block *and* a bigger new one allocated
+  // simultaneously at the moment it reallocates - a real spike on top of
+  // the DynamicJsonDocument this whole JsonArray already lives inside
+  // (parseJSONFromFile's own bufferSize, itself already sized close to the
+  // ESP.getMaxAllocHeap() ceiling that guard checks). ScreenObject is a
+  // large element (five String fields plus a nested std::vector for
+  // tab-control/panel children), so this wasn't a marginal effect -
+  // observed crashing on the very project that guard was written to fix
+  // (2026-08-10's HIL comprehensive-test project.json), well after that
+  // guard had already passed. reserve()'d upfront, this becomes exactly
+  // one correctly-sized allocation instead of an unknown number of
+  // doubling reallocations, each briefly needing ~1.5x the vector's
+  // eventual final size on top of everything else already resident.
+  project_.screens.reserve(screensArray.size());
+
   for (JsonObject screenJson : screensArray) {
     Screen screen;
     screen.id = screenJson["id"] | "";
@@ -203,13 +247,14 @@ void ProjectLoader::parseScreens(JsonArray screensArray) {
 
     if (screenJson["objects"].is<JsonArray>()) {
       JsonArray objectsArray = screenJson["objects"];
+      screen.objects.reserve(objectsArray.size());
       for (JsonObject objJson : objectsArray) {
         ScreenObject obj = parseScreenObject(objJson);
         screen.objects.push_back(obj);
       }
     }
 
-    // buttonActions is a JSON *object* keyed by button id (e.g. "btn-0"),
+    // buttonActions is a JSON *object* keyed by button id (e.g. "button-0"),
     // not an array - mirrors the designer's Record<string,
     // HardwareButtonAction> (components/screenman-editor.tsx), which
     // JSON.stringify's the same way.
@@ -244,7 +289,9 @@ ScreenObject ProjectLoader::parseScreenObject(JsonObject objJson) {
   // every existing project (additive JSON field), so old projects parse
   // identically to before.
   if (objJson["children"].is<JsonArray>()) {
-    for (JsonObject childJson : objJson["children"].as<JsonArray>()) {
+    JsonArray childrenArray = objJson["children"].as<JsonArray>();
+    obj.children.reserve(childrenArray.size());
+    for (JsonObject childJson : childrenArray) {
       obj.children.push_back(parseScreenObject(childJson));
     }
   }

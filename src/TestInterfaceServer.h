@@ -132,4 +132,10 @@ private:
   // pointing at an equivalent endpoint). publishHello() (main.cpp) is what
   // actually advertises this URL; this handler just needs to serve it.
   void handleDdfZip();
+
+  // GET /recovery-project - streams back the last verified deploy's
+  // retained copy (RECOVERY_PROJECT_PATH, DeviceInfo.h), or 404 if this
+  // device has never had one. docs/nested-provenance.md's "Version
+  // compatibility" > Fall 3 (designer repo).
+  void handleRecoveryProject();
 };

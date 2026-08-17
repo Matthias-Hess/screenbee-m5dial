@@ -32,6 +32,7 @@ bool TestInterfaceServer::start() {
   webServer_->on("/api/topic-values", HTTP_GET, [this]() { this->handleGetTopicValues(); });
   webServer_->on("/api/mqtt", HTTP_POST, [this]() { this->handleMqttConfigure(); });
   webServer_->on("/ddf.zip", HTTP_GET, [this]() { this->handleDdfZip(); });
+  webServer_->on("/recovery-project", HTTP_GET, [this]() { this->handleRecoveryProject(); });
 
   webServer_->begin();
   serverRunning_ = true;
@@ -339,4 +340,42 @@ void TestInterfaceServer::handleDdfZip() {
   // truncate at the first one. Only send_P()'s 4-arg overload accepts an
   // explicit content length.
   webServer_->send_P(200, "application/zip", (const char*)DDF_ZIP, sizeof(DDF_ZIP));
+}
+
+// GET /recovery-project - the last successfully-verified deploy
+// DeployManager.cpp promoted to RECOVERY_PROJECT_PATH (DeviceInfo.h),
+// unchanged since (survives a failed extraction, see DeployManager.cpp's
+// own comment). docs/nested-provenance.md's "Version compatibility" >
+// Fall 3 (designer repo) - this is the designer's actual recovery entry
+// point once it grows a "Recover project from device" UI; nothing calls
+// this yet.
+//
+// Streamed via client().write() in chunks, same pattern as sendBMP()
+// above, rather than reading the whole file into one malloc()'d buffer
+// first - this file can be tens to low hundreds of KB (a full editable
+// project plus its own embedded DDF), and there's no reason to hold it
+// all in RAM at once just to hand it to the TCP stack.
+void TestInterfaceServer::handleRecoveryProject() {
+  if (!LittleFS.exists(RECOVERY_PROJECT_PATH)) {
+    webServer_->send(404, "text/plain", "No recovery copy available on this device yet");
+    return;
+  }
+
+  File f = LittleFS.open(RECOVERY_PROJECT_PATH, "r");
+  if (!f) {
+    webServer_->send(500, "text/plain", "Failed to open the recovery copy");
+    return;
+  }
+
+  webServer_->setContentLength(f.size());
+  webServer_->sendHeader("Content-Disposition", "attachment; filename=\"recovered_project.zip\"");
+  webServer_->send(200, "application/zip", "");
+
+  uint8_t buffer[1024];
+  while (f.available()) {
+    size_t n = f.read(buffer, sizeof(buffer));
+    if (n == 0) break;
+    webServer_->client().write(buffer, n);
+  }
+  f.close();
 }

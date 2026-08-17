@@ -150,6 +150,16 @@ String pressedSoftButtonId = "";
 // this only applies to touch, not the front/rear buttons.
 bool suppressPressedButtonAction = false;
 
+// True once button-3/4 (Rotate Left/Right + Push) has dispatched at least
+// once during the current bezel hold - set whenever that combo fires, reset
+// on BtnA.wasPressed(), consumed at BtnA.wasReleased() to skip button-2's
+// own release action for that release. Explicitly decided this way (not
+// e.g. suppressing based on encoder movement) so a hold-then-release with
+// zero rotation still fires button-2 normally - only an actual combo
+// dispatch swallows the release. See project_m5dial_button_combo_actions
+// memory for the full design.
+bool comboButtonFiredDuringHold = false;
+
 // Id of the Switch segment currently held down by touch (empty = none) -
 // same drag-off-to-cancel semantics as pressedSoftButtonId, but a Switch
 // doesn't get a distinct "pressed" visual (unlike SoftwareButton's 3D
@@ -993,18 +1003,28 @@ void loop() {
     enterIdleSleep();
   }
 
-  // Continuous coupling only kicks in when btn-0/btn-1 are configured
-  // exactly as previous-screen/next-screen - the DDF/designer lets either
-  // be assigned any ButtonAction (send-mqtt, goto-screen, ...), and the
+  // Continuous coupling only kicks in when whichever rotate-button pair is
+  // *currently in effect* - button-0/button-1 normally, or button-3/
+  // button-4 while the bezel is held (same per-detent combo swap the
+  // discrete dispatch below uses) - is configured exactly as
+  // previous-screen/next-screen. The DDF/designer lets any of the four be
+  // assigned any ButtonAction (send-mqtt, goto-screen, ...), and the
   // "scroll position tracks the dial in real time" feel below only makes
-  // sense for plain screen navigation. Anything else on those two buttons
+  // sense for plain screen navigation. Anything else on the active pair
   // keeps the original discrete, once-per-detent dispatch further down.
   // Re-checked every iteration (cheap - two small getButtonAction lookups)
-  // since the active screen's own override can change which action is
-  // configured without a reboot.
+  // since the active screen's own override, or the bezel itself, can
+  // change which action is in effect without a reboot - found live
+  // 2026-08-17 as a real gap: a project with navigation bound to the
+  // push-rotate combo (button-3/button-4) instead of plain rotation lost
+  // the smooth animation entirely and fell back to a once-per-detent jump,
+  // since this check only ever looked at button-0/button-1.
+  bool bezelHeldForNav = M5Dial.BtnA.isPressed();
+  const char* navLeftButtonId = bezelHeldForNav ? "button-3" : "button-0";
+  const char* navRightButtonId = bezelHeldForNav ? "button-4" : "button-1";
   bool continuousNavActive = projectLoader.isLoaded() &&
-      projectLoader.getButtonAction(currentScreenIndex, "btn-0").type == "previous-screen" &&
-      projectLoader.getButtonAction(currentScreenIndex, "btn-1").type == "next-screen";
+      projectLoader.getButtonAction(currentScreenIndex, navLeftButtonId).type == "previous-screen" &&
+      projectLoader.getButtonAction(currentScreenIndex, navRightButtonId).type == "next-screen";
 
   if (continuousNavActive) {
     // scrollPosition is a real-valued screen index computed straight from
@@ -1063,39 +1083,53 @@ void loop() {
     // the discrete path below doesn't replay a burst of stale detents.
     lastDispatchedEncoderPos = currentEncoderPosForIdle;
   } else {
-    // Shows the navigator on the very first raw increment, not just once a
-    // full detent completes - marks the CURRENT screen's tablet (no switch
-    // yet), so you see you're "in" the navigator and where you are before
-    // the actual jump happens at the next full click. Also doubles as the
-    // overlay's hold-timer reset: trigger() restarts the same countdown
-    // ScreenNavigatorOverlay uses to fly the tablets back out, so "tablets
-    // disappear after 1.5s with no further increment" falls out of this
-    // same call without a second, separate timer - found live 2026-08-11
-    // this was nicer than waiting for a full click before showing anything.
-    // If this same movement also completes a full detent below,
-    // dispatchButtonAction()'s own trigger() call (with the new index) runs
-    // right after and simply overwrites which tablet ends up marked - no
-    // visible inconsistency, only the final state after both calls in this
-    // iteration ever gets rendered.
-    if (encoderMoved) {
-      screenNavigatorOverlay.trigger(currentScreenIndex);
-    }
+    // No pre-emptive "show on the very first raw increment" anymore - a
+    // 2026-08-11 responsiveness nicety, removed 2026-08-17. It first had to
+    // be gated to only the currently-active button pair (the naive
+    // unconditional version showed the navigator on a plain rotation even
+    // when nothing was bound to screen navigation at all), but the correct
+    // rule turned out simpler than any button-id-based gating: the
+    // navigator should show exactly when a next-screen/previous-screen
+    // command actually *executes*, regardless of which button triggered
+    // it - which is precisely what dispatchButtonAction() below already
+    // does on its own (see that function's own
+    // "Only next-screen/previous-screen trigger the animated navigator"
+    // comment) once a detent actually completes. Trading away the
+    // early-preview feel for correctness - direction isn't knowable yet at
+    // encoderMoved time, so a heuristic here can only ever guess.
 
-    // Rotate Left/Right (btn-0/btn-1) dispatch - see ENCODER_CLICK_INCREMENTS'
-    // own comment. A while loop, not if, so a fast spin that crosses several
-    // detents in one loop() iteration still dispatches once per detent
-    // instead of dropping the extras. No idle-wake suppression here (unlike
-    // touch) - rotating always does the same predictable thing regardless of
-    // whether the screen was visible, same reasoning as the front/rear
-    // buttons.
+    // Rotate Left/Right (button-0/button-1) dispatch - see
+    // ENCODER_CLICK_INCREMENTS' own comment. A while loop, not if, so a fast
+    // spin that crosses several detents in one loop() iteration still
+    // dispatches once per detent instead of dropping the extras. No
+    // idle-wake suppression here (unlike touch) - rotating always does the
+    // same predictable thing regardless of whether the screen was visible,
+    // same reasoning as the front/rear buttons.
+    //
+    // While the bezel (BtnA) is currently held, each detent dispatches
+    // button-3/button-4 (Rotate Left/Right + Push) instead - two more
+    // synthetic hardware buttons, same convention as button-0/button-1
+    // themselves (firmware-invented events, not real physical controls), so
+    // no data-model or designer change was needed to add this combo. Checked
+    // fresh per detent (not cached once per loop()) so a bezel press/release
+    // mid-spin is honored detent-by-detent. See
+    // project_m5dial_button_combo_actions memory for the full design and
+    // comboButtonFiredDuringHold's own comment for the release-suppression
+    // half of this.
     long encoderDeltaSinceDispatch = currentEncoderPosForIdle - lastDispatchedEncoderPos;
     while (encoderDeltaSinceDispatch >= ENCODER_CLICK_INCREMENTS) {
-      dispatchButtonAction(projectLoader.getButtonAction(currentScreenIndex, "btn-1"));
+      bool bezelHeld = M5Dial.BtnA.isPressed();
+      dispatchButtonAction(
+          projectLoader.getButtonAction(currentScreenIndex, bezelHeld ? "button-4" : "button-1"));
+      if (bezelHeld) comboButtonFiredDuringHold = true;
       lastDispatchedEncoderPos += ENCODER_CLICK_INCREMENTS;
       encoderDeltaSinceDispatch -= ENCODER_CLICK_INCREMENTS;
     }
     while (encoderDeltaSinceDispatch <= -ENCODER_CLICK_INCREMENTS) {
-      dispatchButtonAction(projectLoader.getButtonAction(currentScreenIndex, "btn-0"));
+      bool bezelHeld = M5Dial.BtnA.isPressed();
+      dispatchButtonAction(
+          projectLoader.getButtonAction(currentScreenIndex, bezelHeld ? "button-3" : "button-0"));
+      if (bezelHeld) comboButtonFiredDuringHold = true;
       lastDispatchedEncoderPos -= ENCODER_CLICK_INCREMENTS;
       encoderDeltaSinceDispatch += ENCODER_CLICK_INCREMENTS;
     }
@@ -1189,12 +1223,24 @@ void loop() {
 
   testInterfaceServer.handleClient();
 
-  // Front button (btn-2 in the DDF's hardwareButtons list) - fires its
+  // Front button (button-2 in the DDF's hardwareButtons list) - fires its
   // configured ButtonAction (screen override, else project-wide default,
   // else nothing) on release, same trigger point as SoftwareButton touches
-  // above for one consistent rule across every button type.
+  // above for one consistent rule across every button type. Reset the
+  // combo-hold flag on every fresh press so it only ever reflects the
+  // *current* hold.
+  if (M5Dial.BtnA.wasPressed()) {
+    comboButtonFiredDuringHold = false;
+  }
   if (M5Dial.BtnA.wasReleased()) {
-    dispatchButtonAction(projectLoader.getButtonAction(currentScreenIndex, "btn-2"));
+    // Skip button-2's own release action if button-3/4 already fired at
+    // least once during this hold - a hold-and-rotate is a combo gesture,
+    // not "rotate, then also press the front button", so the release
+    // shouldn't double-fire a second, unrelated action. A hold-then-release
+    // with zero rotation still fires button-2 normally (flag stays false).
+    if (!comboButtonFiredDuringHold) {
+      dispatchButtonAction(projectLoader.getButtonAction(currentScreenIndex, "button-2"));
+    }
   }
 
   // Rear button (GPIO0, the same pin used for forcing USB download mode) -

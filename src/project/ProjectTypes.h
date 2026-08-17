@@ -203,7 +203,7 @@ struct ScreenObject {
   std::vector<ScreenObject> children;
 };
 
-// One screen's override for a single button id (e.g. "btn-0") - see
+// One screen's override for a single button id (e.g. "button-0") - see
 // Screen::buttonActions below. A vector of (key, value) pairs rather than
 // std::map, matching this codebase's existing convention of linear-scanning
 // small vectors (see ProjectLoader::getTopicValue) instead of pulling in
@@ -213,11 +213,13 @@ struct ScreenButtonAction {
   ButtonAction action;
 };
 
-// Project-wide default action for a physical button, from the device's
-// hardware-buttons list (public/ddf/*.ddf.zip on the designer side). Only
-// `id` (e.g. "btn-0") and `defaultAction` matter to firmware - the rest of
-// the designer's HardwareButton (name, svgElementId, shape, x/y/width/
-// height) is on-canvas rendering metadata for the button overlay only.
+// Project-wide default action for a physical button. `id` is exactly the
+// adornment SVG's own element id (e.g. "button-0") - the designer no longer
+// declares a separate hardwareButtons[] list in device.json at all
+// (2026-08-16); every id^="button" element in the SVG *is* a hardware
+// button, and that same id is what firmware must match here. Only `id` and
+// `defaultAction` matter to firmware - the designer's HardwareButton.name
+// is designer-UI-only metadata (the button's display label).
 struct HardwareButtonDef {
   String id;
   ButtonAction defaultAction;
@@ -231,7 +233,7 @@ struct Screen {
   String backgroundColor;                 // Screen fill color, e.g. "#ffffff" (optional, defaults to white)
   std::vector<ScreenObject> objects;
   // Per-screen override of a button's action, keyed by button id (e.g.
-  // "btn-0") - takes priority over ProjectConfig::hardwareButtons's
+  // "button-0") - takes priority over ProjectConfig::hardwareButtons's
   // defaultAction for the same id. Absent for older projects (additive
   // JSON field), in which case every button on this screen just falls back
   // to the project-wide default, same as if this were empty.

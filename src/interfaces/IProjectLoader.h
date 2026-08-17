@@ -37,14 +37,14 @@ public:
   virtual void setTopicValue(const String& topic, const String& value) = 0;
 
   /**
-   * Resolve the effective action for a button (e.g. "btn-0") on a given
+   * Resolve the effective action for a button (e.g. "button-0") on a given
    * screen: that screen's own override if it has one, else the project-
    * wide default for that button id, else a default-constructed
    * ButtonAction (empty `type` - caller treats this as "nothing configured
    * here, do whatever the generic fallback behavior is").
    * @param screenIndex Index of the currently-displayed screen (-1 or
    *   out-of-range is treated as "no screen override available")
-   * @param buttonId Button id string, e.g. "btn-0"
+   * @param buttonId Button id string, e.g. "button-0"
    */
   virtual ButtonAction getButtonAction(int screenIndex, const String& buttonId) const = 0;
 };

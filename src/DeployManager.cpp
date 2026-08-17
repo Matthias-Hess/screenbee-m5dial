@@ -15,6 +15,16 @@
 namespace {
 const char* DEPLOY_DOWNLOAD_PATH = "/deploy_download.zip";
 }
+// RECOVERY_PROJECT_PATH itself is #defined in DeviceInfo.h, not local to
+// this file - see that definition's own comment for why (TestInterfaceServer.cpp
+// needs to agree on the same path to serve it back). The verified download
+// gets renamed there once it's passed CRC32/schemaVersion/deviceId, below,
+// and stays there regardless of whether extraction into /PROJECT
+// afterward succeeds. Holds the same nested-provenance chain the export
+// carries: the baked bitmaps live in /PROJECT for rendering, but this
+// file's own _source/project.zip entry is the actual editable project
+// (which itself carries _source/ddf.zip) - the thing a recovery request
+// hands back.
 
 void DeployManager::handleDeployMessage(const String& payload) {
   if (!publishStatus_) {
@@ -77,12 +87,28 @@ void DeployManager::handleDeployMessage(const String& payload) {
     return;
   }
 
-  // deviceId check happens here, still before installProjectZipFromFile()
-  // ever wipes /PROJECT - ProjectInstaller::installProjectZipFromFile()'s
-  // own header comment is explicit that it's "not rollback-safe on its
-  // own", so every check that could reject this deploy has to run first,
-  // same "never touch /PROJECT until verified" guarantee
-  // hil/README.md documents for the e-paper target's identical flow.
+  // schemaVersion and deviceId checks happen here, still before
+  // installProjectZipFromFile() ever wipes /PROJECT -
+  // ProjectInstaller::installProjectZipFromFile()'s own header comment is
+  // explicit that it's "not rollback-safe on its own", so every check
+  // that could reject this deploy has to run first, same "never touch
+  // /PROJECT until verified" guarantee hil/README.md documents for the
+  // e-paper target's identical flow.
+  //
+  // schemaVersion first: if the export's own file shape can't be trusted,
+  // there's no point reading anything else out of it, deviceId included -
+  // see docs/nested-provenance.md's "Version compatibility" > Fall 2,
+  // step 1 (designer repo).
+  long uploadedSchemaVersion = ProjectInstaller::peekProjectSchemaVersion(DEPLOY_DOWNLOAD_PATH);
+  if (uploadedSchemaVersion > EXPORT_SCHEMA_VERSION) {
+    Serial.printf("[DeployManager] schemaVersion too new (%ld > %d) - not touching /PROJECT\n",
+                   uploadedSchemaVersion, EXPORT_SCHEMA_VERSION);
+    publishStatus_(deployId, "error", "Project file format is newer than this firmware understands", -1);
+    LittleFS.remove(DEPLOY_DOWNLOAD_PATH);
+    busy_ = false;
+    return;
+  }
+
   String uploadedDeviceId = ProjectInstaller::peekProjectDeviceId(DEPLOY_DOWNLOAD_PATH);
   if (!uploadedDeviceId.isEmpty() && uploadedDeviceId != DEVICE_ID) {
     Serial.printf("[DeployManager] deviceId mismatch (\"%s\" != \"%s\") - not touching /PROJECT\n",
@@ -93,17 +119,39 @@ void DeployManager::handleDeployMessage(const String& payload) {
     return;
   }
 
+  // Promote the staged, now-verified download to the permanent recovery
+  // slot before attempting extraction, not after - see this file's
+  // "backup is the retained download, not a separate write" reasoning
+  // (docs/nested-provenance.md, designer repo). LittleFS.rename()
+  // atomically replaces any existing file at the destination (a core
+  // littlefs power-loss-safety guarantee - see littlefs's own design
+  // docs), so there's never a window with zero recovery copies, and this
+  // costs nothing extra in flash or time: the file's bytes don't move,
+  // only its directory entry does. Everything below reads from
+  // RECOVERY_PROJECT_PATH now, not DEPLOY_DOWNLOAD_PATH, which no longer
+  // exists once the rename succeeds - and deliberately survives even if
+  // extraction below fails, so a bad /PROJECT extraction never also costs
+  // the recovery copy.
+  bool promoted = LittleFS.rename(DEPLOY_DOWNLOAD_PATH, RECOVERY_PROJECT_PATH);
+  if (!promoted) {
+    Serial.println("[DeployManager] Failed to promote download to the recovery slot - deploy continues, but this attempt won't be recoverable later");
+  }
+  const char* installPath = promoted ? RECOVERY_PROJECT_PATH : DEPLOY_DOWNLOAD_PATH;
+
   publishStatus_(deployId, "applying", "", -1);
   String installError;
-  if (!ProjectInstaller::installProjectZipFromFile(DEPLOY_DOWNLOAD_PATH, installError)) {
+  if (!ProjectInstaller::installProjectZipFromFile(installPath, installError)) {
     Serial.printf("[DeployManager] Install failed: %s\n", installError.c_str());
     publishStatus_(deployId, "error", installError, -1);
-    LittleFS.remove(DEPLOY_DOWNLOAD_PATH);
+    // Deliberately not deleting installPath: if the promote above
+    // succeeded, this is the recovery slot and must survive a failed
+    // install; if the promote itself failed, this is still
+    // DEPLOY_DOWNLOAD_PATH, which the next deploy attempt's own
+    // LittleFS.remove() at the top of this function cleans up anyway.
     busy_ = false;
     return;
   }
 
-  LittleFS.remove(DEPLOY_DOWNLOAD_PATH);
   publishStatus_(deployId, "rebooting", "", -1);
   Serial.println("[DeployManager] Deploy applied, restarting");
   delay(500);  // let the "rebooting" MQTT publish actually flush before the restart tears down the radio

@@ -296,6 +296,90 @@ String peekProjectDeviceId(const String& zipPath) {
   return String(deviceId);
 }
 
+// Mirrors peekProjectDeviceId() above almost verbatim (same zip-open,
+// locate, extract, verify steps) rather than sharing a helper with it -
+// peekProjectDeviceId() is exercised by main.cpp's JTAG memory-corruption
+// probe (see its own comment) and by every real deploy via
+// DeployManager.cpp, so it stays untouched here rather than risking a
+// refactor neither a compiler nor real hardware was available to verify
+// against this session (2026-08-15).
+//
+// Returns -1 if the file couldn't be read/parsed at all (fails open, same
+// as peekProjectDeviceId() returning "" - a peek failure isn't itself
+// evidence anything is wrong, installProjectZipFromFile()'s own robust
+// parsing is still the real gate). Returns 1 (not -1) when the field is
+// simply absent - see docs/nested-provenance.md's "Version compatibility"
+// section: an export predating this field is schemaVersion 1 by
+// definition, same "optional field, default when omitted" convention as
+// everywhere else this project uses it.
+long peekProjectSchemaVersion(const String& zipPath) {
+  File zipFile = LittleFS.open(zipPath, "r");
+  if (!zipFile) return -1;
+
+  size_t zipSize = zipFile.size();
+  ZipFileReadContext readCtx{&zipFile};
+
+  mz_zip_archive zip;
+  memset(&zip, 0, sizeof(zip));
+  useDictReservingAllocator(zip);
+  useStreamingReader(zip, readCtx);
+  if (!mz_zip_reader_init(&zip, zipSize, 0)) {
+    zipFile.close();
+    return -1;
+  }
+
+  mz_uint32 fileIndex = 0;
+  if (!mz_zip_reader_locate_file_v2(&zip, "project.json", nullptr, 0, &fileIndex)) {
+    mz_zip_reader_end(&zip);
+    zipFile.close();
+    return -1;
+  }
+
+  mz_zip_archive_file_stat fileStat;
+  memset(&fileStat, 0, sizeof(fileStat));
+  if (!mz_zip_reader_file_stat(&zip, fileIndex, &fileStat)) {
+    mz_zip_reader_end(&zip);
+    zipFile.close();
+    return -1;
+  }
+
+  size_t jsonSize = fileStat.m_uncomp_size;
+  uint8_t* jsonData = (uint8_t*)malloc(jsonSize);
+  if (!jsonData) {
+    mz_zip_reader_end(&zip);
+    zipFile.close();
+    return -1;
+  }
+
+  bool extractOk = false;
+  mz_zip_reader_extract_iter_state* pState = mz_zip_reader_extract_iter_new(&zip, fileIndex, 0);
+  if (pState) {
+    size_t totalRead = 0;
+    while (totalRead < jsonSize) {
+      size_t bytesRead = mz_zip_reader_extract_iter_read(pState, jsonData + totalRead, jsonSize - totalRead);
+      if (bytesRead == 0) break;
+      totalRead += bytesRead;
+    }
+    mz_zip_reader_extract_iter_free(pState);
+    extractOk = (totalRead == jsonSize) && (mz_crc32(MZ_CRC32_INIT, jsonData, jsonSize) == fileStat.m_crc32);
+  }
+
+  mz_zip_reader_end(&zip);
+  zipFile.close();
+
+  if (!extractOk) {
+    free(jsonData);
+    return -1;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, (const char*)jsonData, jsonSize, DeserializationOption::NestingLimit(30));
+  free(jsonData);
+  if (err) return -1;
+
+  return doc["schemaVersion"] | 1L;
+}
+
 bool installProjectZipFromFile(const String& zipPath, String& errorOut) {
   if (LittleFS.exists("/PROJECT")) {
     deleteDirectoryIterative("/PROJECT");
@@ -330,6 +414,20 @@ bool installProjectZipFromFile(const String& zipPath, String& errorOut) {
     mz_zip_archive_file_stat file_stat;
     if (!mz_zip_reader_file_stat(&zip, i, &file_stat)) continue;
     if (mz_zip_reader_is_file_a_directory(&zip, i)) continue;
+
+    // Nested-provenance recovery payload (designer repo's
+    // docs/nested-provenance.md, "Nesting is zip-in-zip") - an opaque
+    // embedded project/DDF blob under this fixed prefix, never needed at
+    // runtime and never extracted here. Two reasons, not one: it wastes
+    // flash unpacking a second copy of data that already sits safely
+    // compressed inside the retained staged zip (see DeployManager.cpp's
+    // handling of DEPLOY_DOWNLOAD_PATH), and it would otherwise run
+    // through the same fragile DEFLATE-extraction path
+    // (mz_zip_reader_extract_iter_*, the 32KB dictionary window above)
+    // that a multi-day investigation on 2026-08-09 stabilized against heap
+    // fragmentation - no reason to push more bytes through it than the
+    // screen actually needs to render.
+    if (String(file_stat.m_filename).startsWith("_source/")) continue;
 
     String outPath = "/PROJECT/" + String(file_stat.m_filename);
     int lastSlash = outPath.lastIndexOf('/');

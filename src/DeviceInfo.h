@@ -20,7 +20,26 @@
 // DDF straight from a live device, matching the e-paper firmware's own
 // "announced device" support. Bump this whenever the DDF changes so a
 // stale cached copy gets refetched.
-#define DDF_VERSION "1.6"
+#define DDF_VERSION "1.9"
+
+// The device-facing export file format's own schemaVersion this firmware
+// understands (2026-08-15, docs/nested-provenance.md's "Version
+// compatibility" section, designer repo) - a single integer, separate
+// from DDF_VERSION above (that's this device's own *capabilities*; this
+// is whether the export's project.json *shape* can be parsed at all).
+// Bumped only on a real structural break in what lib/project-zip.ts's
+// buildDeviceProjectZip() produces; additive fields never need this
+// bumped. DeployManager.cpp rejects any deploy whose own schemaVersion is
+// higher than this, before touching /PROJECT.
+#define EXPORT_SCHEMA_VERSION 1
+
+// Where DeployManager.cpp promotes a verified deploy download to, and
+// TestInterfaceServer.cpp's recovery endpoint (GET /recovery-project)
+// reads back from - shared here (rather than staying private to
+// DeployManager.cpp, as DEPLOY_DOWNLOAD_PATH still is) specifically so both
+// files agree on it. See docs/nested-provenance.md's "Version
+// compatibility" > Fall 3 (designer repo).
+#define RECOVERY_PROJECT_PATH "/recovery_project.zip"
 
 // The MQTT topic namespace every device/browser participant in the deploy
 // flow shares (screenbee/<clientId>/...) - same shared protocol as every

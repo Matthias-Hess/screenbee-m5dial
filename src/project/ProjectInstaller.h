@@ -19,6 +19,16 @@ namespace ProjectInstaller {
 // against.
 String peekProjectDeviceId(const String& zipPath);
 
+// Same idea as peekProjectDeviceId() above, for the export file format's
+// own schemaVersion (docs/nested-provenance.md's "Version compatibility"
+// section, designer repo) rather than a device's identity. Returns -1 if
+// the zip/entry/field couldn't be read/parsed at all (treat as "unknown,
+// don't trust it" - same convention as peekProjectDeviceId()'s empty
+// string); a *present but absent field* returns 1, not -1 (schemaVersion
+// 1 is the implicit version every export used before this field existed).
+// Compare against EXPORT_SCHEMA_VERSION in DeviceInfo.h.
+long peekProjectSchemaVersion(const String& zipPath);
+
 // Wipes and recreates /PROJECT, extracts every entry from the zip at
 // zipPath into it, and confirms project.json ended up there. Returns false
 // (with errorOut set) on any failure. Not rollback-safe on its own -
